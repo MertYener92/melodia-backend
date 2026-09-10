@@ -439,3 +439,14 @@ Outputs:
     Value: !Ref AudioBucket
   AudioCloudFrontDomain:
     Value: !GetAtt AudioDistribution.DomainName
+  UsersTableName:
+    Description: >
+      melodia-video ve melodia-music-spec stack'lerinin ayni jeton/kota
+      havuzunu kontrol edebilmesi icin disari acilan tablo adi.
+    Value: !Ref UsersTable
+    Export:
+      Name: melodia-users-table-name
+  UsersTableArn:
+    Value: !GetAtt UsersTable.Arn
+    Export:
+      Name: melodia-users-table-arn
