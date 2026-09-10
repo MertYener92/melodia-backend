@@ -1,0 +1,441 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Melodia backend (Faz 2) - kullanıcı kotasını kontrol edip Suno API'ye
+  istek yönlendiren güvenli proxy. Artık üretilen şarkı dosyaları Suno'nun
+  geçici sunucusunda bırakılmıyor; kaydedilirken kendi S3 bucket'ımıza
+  kopyalanıp CloudFront üzerinden, imzalı URL ile sunuluyor.
+
+Parameters:
+  AppleBundleId:
+    Type: String
+    Default: "com.melodia.app"
+  CloudFrontPublicKeyPem:
+    Type: String
+    Description: Audio dağıtımı için RSA public key PEM içeriği.
+  CloudFrontPrivateKeySecretArn:
+    Type: String
+    Description: Private key'i içeren Secrets Manager secret ARN'i.
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 256
+    Runtime: nodejs20.x
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref UsersTable
+        SUNO_API_KEY: '{{resolve:secretsmanager:melodia/suno-api-key}}'
+        SONGS_TABLE_NAME: !Ref SongsTable
+        AUDIO_BUCKET_NAME: !Ref AudioBucket
+        CLOUDFRONT_DOMAIN: !GetAtt AudioDistribution.DomainName
+        CLOUDFRONT_KEY_PAIR_ID: !GetAtt AudioPublicKey.Id
+        CLOUDFRONT_PRIVATE_KEY_SECRET_ARN: !Ref CloudFrontPrivateKeySecretArn
+
+Resources:
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: melodia-users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+
+  SongsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: melodia-songs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: songId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: songId
+          KeyType: RANGE
+
+  # ---------------------------------------------------------------
+  # YENİ: Şarkı ses dosyaları için kalıcı, private depolama
+  # ---------------------------------------------------------------
+  AudioBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub melodia-audio-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AudioBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AudioBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${AudioBucket.Arn}/songs/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${AudioDistribution}"
+
+  AudioOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: melodia-audio-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  AudioPublicKey:
+    Type: AWS::CloudFront::PublicKey
+    Properties:
+      PublicKeyConfig:
+        Name: melodia-audio-key
+        EncodedKey: !Ref CloudFrontPublicKeyPem
+        CallerReference: melodia-audio-key-v1
+
+  AudioKeyGroup:
+    Type: AWS::CloudFront::KeyGroup
+    Properties:
+      KeyGroupConfig:
+        Name: melodia-audio-key-group
+        Items:
+          - !Ref AudioPublicKey
+
+  AudioDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultCacheBehavior:
+          TargetOriginId: AudioS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # AWS Managed-CachingOptimized
+          TrustedKeyGroups:
+            - !Ref AudioKeyGroup
+        Origins:
+          - Id: AudioS3Origin
+            DomainName: !GetAtt AudioBucket.RegionalDomainName
+            OriginAccessControlId: !Ref AudioOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: melodia-users-pool
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: melodia-mobile-app
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+
+  GenerateSongFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: generate.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /generate
+            Method: post
+
+  LyricsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: lyrics.handler
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /lyrics
+            Method: post
+
+  LyricsStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: lyricsStatus.handler
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /lyrics-status
+            Method: get
+
+  StatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: status.handler
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /status
+            Method: get
+
+  SunoCallbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: sunoCallback.handler
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /suno-callback
+            Method: post
+            Auth:
+              Authorizer: NONE
+
+  AppleAuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: appleAuth.handler
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          USER_POOL_CLIENT_ID: !Ref UserPoolClient
+          APPLE_BUNDLE_ID: !Ref AppleBundleId
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminSetUserPassword
+                - cognito-idp:AdminInitiateAuth
+                - cognito-idp:AdminGetUser
+              Resource: !GetAtt UserPool.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /auth/apple
+            Method: post
+            Auth:
+              Authorizer: NONE
+
+  GetQuotaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: quota.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /quota
+            Method: get
+
+  LyricsTimestampsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: lyricsTimestamps.handler
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /lyrics-timestamps
+            Method: post
+
+  # DEĞİŞTİ: artık Suno'dan gelen sesi indirip AudioBucket'a kopyalıyor,
+  # bu yüzden S3 yazma izni ve daha uzun timeout gerekiyor.
+  SaveSongFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: saveSong.handler
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SongsTable
+        - S3CrudPolicy:
+            BucketName: !Ref AudioBucket
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /songs
+            Method: post
+
+  ListSongsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: listSongs.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref SongsTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /songs
+            Method: get
+
+  # YENİ: şarkı her çalınmak istendiğinde taze CloudFront signed URL üretir
+  GetSongPlayUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: getSongPlayUrl.handler
+      Timeout: 15
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref SongsTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref CloudFrontPrivateKeySecretArn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /songs/{songId}/play-url
+            Method: get
+
+  # YENİ: kullanıcı kütüphanesinden tek bir şarkıyı siler
+  DeleteSongFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: deleteSong.handler
+      Timeout: 15
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SongsTable
+        - S3CrudPolicy:
+            BucketName: !Ref AudioBucket
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /songs/{songId}
+            Method: delete
+
+  DeleteAccountFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: deleteAccount.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          VIDEO_PROJECTS_TABLE_NAME: melodia-video-projects
+          VIDEO_BUCKET_NAME: !Sub "melodia-video-${AWS::AccountId}-${AWS::Region}"
+          USER_POOL_ID: !Ref UserPool
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SongsTable
+        - S3CrudPolicy:
+            BucketName: !Ref AudioBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Scan
+                - dynamodb:DeleteItem
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/melodia-video-projects"
+            - Effect: Allow
+              Action:
+                - s3:DeleteObject
+              Resource: !Sub "arn:aws:s3:::melodia-video-${AWS::AccountId}-${AWS::Region}/*"
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminDeleteUser
+              Resource: !GetAtt UserPool.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /account
+            Method: delete
+
+  MelodiaApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuth
+        Authorizers:
+          CognitoAuth:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${MelodiaApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  AudioBucketName:
+    Value: !Ref AudioBucket
+  AudioCloudFrontDomain:
+    Value: !GetAtt AudioDistribution.DomainName

@@ -1,0 +1,8 @@
+﻿node_modules/
+.aws-sam/
+.env
+.env.local
+*.log
+npm-debug.log*
+.vscode/
+.idea/
