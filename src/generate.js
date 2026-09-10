@@ -3,12 +3,32 @@ const {
   DynamoDBDocumentClient,
   GetCommand,
   UpdateCommand,
+  PutCommand,
 } = require("@aws-sdk/lib-dynamodb");
 
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const TABLE_NAME = process.env.TABLE_NAME;
 const SUNO_API_KEY = process.env.SUNO_API_KEY;
 const SUNO_BASE_URL = "https://api.sunoapi.org";
+const COST_LOG_TABLE_NAME = process.env.COST_LOG_TABLE_NAME;
+
+// GERÇEK maliyet ölçümü için: Suno'nun task-bazlı kredi bilgisi dönmediği
+// için, istekten HEMEN ÖNCE hesap bakiyesini kaydediyoruz. sunoCallback.js
+// şarkı bittiğinde bakiyeyi tekrar ölçüp farkı hesaplayacak. Test aşamasında
+// (tek kullanıcı, eşzamanlı istek yok) bu fark %100 doğrudur.
+async function getSunoCreditBalance() {
+  try {
+    const res = await fetch(`${SUNO_BASE_URL}/api/v1/generate/credit`, {
+      headers: { Authorization: `Bearer ${SUNO_API_KEY}` },
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await res.json();
+    return typeof data?.data === "number" ? data.data : null;
+  } catch (err) {
+    console.error("Suno bakiye sorgusu başarısız:", err);
+    return null;
+  }
+}
 
 // Paket tanımları: subscriptionTier -> aylık şarkı hakkı
 // (App Store / Play Store'daki abonelik ürün ID'lerinle eşleştir)
@@ -61,6 +81,9 @@ exports.handler = async (event) => {
     // tanımlarsak döngüsel bağımlılık oluşur, bu yüzden runtime'da kuruyoruz).
     const callBackUrl = `https://${event.headers.Host}/${event.requestContext.stage}/suno-callback`;
 
+    // Gerçek maliyet ölçümü — isteği atmadan hemen önceki bakiye.
+    const creditsBefore = await getSunoCreditBalance();
+
     const sunoResponse = await fetch(`${SUNO_BASE_URL}/api/v1/generate`, {
       method: "POST",
       headers: {
@@ -90,6 +113,26 @@ exports.handler = async (event) => {
           message: sunoData.msg || "Şarkı üretimi başlatılamadı.",
         }),
       };
+    }
+
+    // Bakiyeyi taskId'ye bağlı olarak kaydet — sunoCallback.js şarkı
+    // bittiğinde bunu okuyup gerçek harcanan krediyi hesaplayacak.
+    if (creditsBefore != null && COST_LOG_TABLE_NAME) {
+      const taskId = sunoData?.data?.taskId;
+      if (taskId) {
+        const nowSec = Math.floor(Date.now() / 1000);
+        await client.send(
+          new PutCommand({
+            TableName: COST_LOG_TABLE_NAME,
+            Item: {
+              taskId,
+              creditsBefore,
+              createdAt: new Date().toISOString(),
+              expiresAt: nowSec + 7 * 24 * 60 * 60, // 7 gün sonra TTL ile silinir
+            },
+          })
+        );
+      }
     }
 
     // 5) SADECE başarılı istekte kota bir arttırılır (atomik update)

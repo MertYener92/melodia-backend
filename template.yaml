@@ -45,6 +45,26 @@ Resources:
         - AttributeName: userId
           KeyType: HASH
 
+  # Suno'nun her sarki uretiminde GERCEKTE kac kredi harcadigini olcmek
+  # icin gecici bir kayit tablosu. generate.js istek atmadan ONCE bakiyeyi
+  # buraya yazar, sunoCallback.js sarki bitince bakiyeyi tekrar olcup
+  # farki hesaplar ve CloudWatch loglarina yazar. Test asamasinda (tek
+  # kullanici) bu fark kesin dogrudur. TTL ile 7 gun sonra otomatik silinir.
+  GenerationCostLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: melodia-generation-cost-log
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: taskId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: taskId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
   SongsTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -158,9 +178,14 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: generate.handler
+      Environment:
+        Variables:
+          COST_LOG_TABLE_NAME: !Ref GenerationCostLogTable
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GenerationCostLogTable
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
       Events:
@@ -224,6 +249,14 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: sunoCallback.handler
+      Environment:
+        Variables:
+          COST_LOG_TABLE_NAME: !Ref GenerationCostLogTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GenerationCostLogTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
       Events:
         Api:
           Type: Api
