@@ -4,10 +4,15 @@ const { DynamoDBDocumentClient, GetCommand } = require("@aws-sdk/lib-dynamodb");
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const TABLE_NAME = process.env.TABLE_NAME;
 
-const PLAN_LIMITS = {
-  free: 2,
-  basic_monthly: 20,
-  pro_monthly: 60,
+// BİRLEŞİK JETON HAVUZU — generate.js, createVideoProject.js ve app.py
+// ile AYNI alanları (aiCreditsUsed, aiCreditsPeriod) okuyor. Eski ayrı
+// "usageCount" (sadece şarkı) sistemi tamamen kaldırıldı.
+//
+// TAHMINI DEGERLER — gercek maliyetler netlestikce ayarlanabilir.
+const AI_CREDIT_LIMITS = {
+  free: Number.MAX_SAFE_INTEGER,
+  basic_monthly: 100,
+  pro_monthly: 300,
 };
 
 exports.handler = async (event) => {
@@ -20,8 +25,8 @@ exports.handler = async (event) => {
   const now = new Date();
   const currentPeriod = `${now.getFullYear()}-${now.getMonth() + 1}`;
   const plan = user?.plan || "free";
-  const limit = PLAN_LIMITS[plan] ?? PLAN_LIMITS.free;
-  const used = user?.usagePeriod === currentPeriod ? user.usageCount : 0;
+  const limit = AI_CREDIT_LIMITS[plan] ?? AI_CREDIT_LIMITS.free;
+  const used = user?.aiCreditsPeriod === currentPeriod ? (user.aiCreditsUsed || 0) : 0;
 
   return {
     statusCode: 200,

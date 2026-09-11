@@ -12,7 +12,11 @@ async function sunoFetch(path, options = {}) {
     signal: AbortSignal.timeout(25000),
   });
   const data = await response.json();
-  return { ok: response.ok && data.code === 200, status: response.status, data };
+  const ok = response.ok && data.code === 200;
+  if (!ok) {
+    console.error(`Suno API hatası — path=${path}, HTTP ${response.status}, cevap:`, JSON.stringify(data));
+  }
+  return { ok, status: response.status, data };
 }
 
 module.exports = { sunoFetch };

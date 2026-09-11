@@ -10,6 +10,14 @@ Parameters:
   AppleBundleId:
     Type: String
     Default: "com.melodia.app"
+  SongCreditCost:
+    Type: Number
+    Default: 1
+    Description: >
+      TAHMINI DEGER. Bir sarki uretimi kac jeton harcasin? melodia-video ve
+      melodia-music-spec ile AYNI birlesik jeton havuzundan dusuyor.
+      Gercek maliyet netlesince bu degeri degistirip sadece "sam deploy"
+      ile tekrar deploy et, koda dokunmana gerek yok.
   CloudFrontPublicKeyPem:
     Type: String
     Description: Audio dağıtımı için RSA public key PEM içeriği.
@@ -180,12 +188,10 @@ Resources:
       Handler: generate.handler
       Environment:
         Variables:
-          COST_LOG_TABLE_NAME: !Ref GenerationCostLogTable
+          SONG_CREDIT_COST: !Ref SongCreditCost
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
-        - DynamoDBCrudPolicy:
-            TableName: !Ref GenerationCostLogTable
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
       Events:
@@ -249,12 +255,7 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: sunoCallback.handler
-      Environment:
-        Variables:
-          COST_LOG_TABLE_NAME: !Ref GenerationCostLogTable
       Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref GenerationCostLogTable
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
       Events:

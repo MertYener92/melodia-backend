@@ -3,76 +3,77 @@ const {
   DynamoDBDocumentClient,
   GetCommand,
   UpdateCommand,
-  PutCommand,
 } = require("@aws-sdk/lib-dynamodb");
 
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const TABLE_NAME = process.env.TABLE_NAME;
 const SUNO_API_KEY = process.env.SUNO_API_KEY;
 const SUNO_BASE_URL = "https://api.sunoapi.org";
-const COST_LOG_TABLE_NAME = process.env.COST_LOG_TABLE_NAME;
+const SONG_CREDIT_COST = Number(process.env.SONG_CREDIT_COST || 1);
 
-// GERÇEK maliyet ölçümü için: Suno'nun task-bazlı kredi bilgisi dönmediği
-// için, istekten HEMEN ÖNCE hesap bakiyesini kaydediyoruz. sunoCallback.js
-// şarkı bittiğinde bakiyeyi tekrar ölçüp farkı hesaplayacak. Test aşamasında
-// (tek kullanıcı, eşzamanlı istek yok) bu fark %100 doğrudur.
-async function getSunoCreditBalance() {
-  try {
-    const res = await fetch(`${SUNO_BASE_URL}/api/v1/generate/credit`, {
-      headers: { Authorization: `Bearer ${SUNO_API_KEY}` },
-      signal: AbortSignal.timeout(10000),
-    });
-    const data = await res.json();
-    return typeof data?.data === "number" ? data.data : null;
-  } catch (err) {
-    console.error("Suno bakiye sorgusu başarısız:", err);
-    return null;
-  }
+// BİRLEŞİK JETON HAVUZU — melodia-video (createVideoProject.js) ve
+// melodia-music-spec (app.py) ile AYNI alanları (aiCreditsUsed,
+// aiCreditsPeriod) kullanıyor, aynı UsersTable üzerinde. Şarkı, video,
+// music-spec artık tek bir "jeton" bakiyesinden düşüyor — eskiden burada
+// ayrı bir "usageCount" sayacı vardı, o tamamen kaldırıldı.
+//
+// TAHMINI DEGERLER — gercek maliyetler netlestikce ayarlanabilir.
+// Test asamasinda free plani pratik olarak sinirsiz.
+const AI_CREDIT_LIMITS = {
+  free: Number.MAX_SAFE_INTEGER,
+  basic_monthly: 100,
+  pro_monthly: 300,
+};
+
+async function checkCreditsAvailable(userId, cost) {
+  const { Item: user } = await client.send(
+    new GetCommand({ TableName: TABLE_NAME, Key: { userId } })
+  );
+
+  const now = new Date();
+  const currentPeriod = `${now.getFullYear()}-${now.getMonth() + 1}`;
+  const plan = user?.plan || "free";
+  const limit = AI_CREDIT_LIMITS[plan] ?? AI_CREDIT_LIMITS.free;
+  const used = user?.aiCreditsPeriod === currentPeriod ? (user.aiCreditsUsed || 0) : 0;
+
+  return { allowed: used + cost <= limit, remaining: Math.max(limit - used, 0), used, currentPeriod };
 }
 
-// Paket tanımları: subscriptionTier -> aylık şarkı hakkı
-// (App Store / Play Store'daki abonelik ürün ID'lerinle eşleştir)
-//
-// GEÇİCİ: Test aşamasında free planı sınırsız yaptık (Number.MAX_SAFE_INTEGER).
-// Yayına almadan önce bunu tekrar makul bir sayıya (örn. 2) çevirmeyi unutma.
-const PLAN_LIMITS = {
-  free: Number.MAX_SAFE_INTEGER,
-  basic_monthly: 20, // örn. 400 TL'lik paketin
-  pro_monthly: 60,
-};
+async function deductCredits(userId, cost, used, currentPeriod) {
+  await client.send(
+    new UpdateCommand({
+      TableName: TABLE_NAME,
+      Key: { userId },
+      UpdateExpression:
+        "SET aiCreditsUsed = :newUsed, aiCreditsPeriod = :period, #plan = if_not_exists(#plan, :freePlan)",
+      ExpressionAttributeNames: { "#plan": "plan" },
+      ExpressionAttributeValues: {
+        ":newUsed": used + cost,
+        ":period": currentPeriod,
+        ":freePlan": "free",
+      },
+    })
+  );
+}
 
 exports.handler = async (event) => {
   try {
     // 1) Kullanıcı kim? (Cognito token'ından otomatik gelir, taklit edilemez)
     const userId = event.requestContext.authorizer.claims.sub;
 
-    // 2) Kullanıcının mevcut kota kaydını çek
-    const { Item: user } = await client.send(
-      new GetCommand({ TableName: TABLE_NAME, Key: { userId } })
-    );
-
-    const now = new Date();
-    const currentPeriod = `${now.getFullYear()}-${now.getMonth() + 1}`; // "2026-9"
-
-    const plan = user?.plan || "free";
-    const limit = PLAN_LIMITS[plan] ?? PLAN_LIMITS.free;
-
-    // Yeni ay başladıysa sayaç sıfırlanmış gibi davran
-    const usedThisPeriod =
-      user?.usagePeriod === currentPeriod ? user.usageCount : 0;
-
-    // 3) KOTA KONTROLÜ — asıl güvenlik burada, sunucu tarafında
-    if (usedThisPeriod >= limit) {
+    // 2) JETON KONTROLÜ — Suno'ya hiç istek atmadan önce, asıl güvenlik burada
+    const creditCheck = await checkCreditsAvailable(userId, SONG_CREDIT_COST);
+    if (!creditCheck.allowed) {
       return {
         statusCode: 429,
         body: JSON.stringify({
           error: "quota_exceeded",
-          message: `Bu ayki ${limit} şarkı hakkınızı kullandınız. Yeni pakette devam edin.`,
+          message: `Bu ayki jeton hakkınız yetersiz (kalan: ${creditCheck.remaining}, gereken: ${SONG_CREDIT_COST}).`,
         }),
       };
     }
 
-    // 4) Kota uygunsa, isteği request body'den al ve Suno'ya ilet
+    // 3) Kota uygunsa, isteği request body'den al ve Suno'ya ilet
     const body = JSON.parse(event.body || "{}");
 
     // Suno bu alanı zorunlu tutuyor; sonucu zaten /status ile polling
@@ -80,9 +81,6 @@ exports.handler = async (event) => {
     // kendi adresinden anlık olarak hesaplıyoruz (CloudFormation'da sabit
     // tanımlarsak döngüsel bağımlılık oluşur, bu yüzden runtime'da kuruyoruz).
     const callBackUrl = `https://${event.headers.Host}/${event.requestContext.stage}/suno-callback`;
-
-    // Gerçek maliyet ölçümü — isteği atmadan hemen önceki bakiye.
-    const creditsBefore = await getSunoCreditBalance();
 
     const sunoResponse = await fetch(`${SUNO_BASE_URL}/api/v1/generate`, {
       method: "POST",
@@ -105,7 +103,11 @@ exports.handler = async (event) => {
     const sunoData = await sunoResponse.json();
 
     if (!sunoResponse.ok || sunoData.code !== 200) {
-      // Suno hata verdiyse kullanıcının kotasını DÜŞÜRME — hakkı sende dursun
+      // Suno hata verdiyse kullanıcının jetonunu DÜŞÜRME — hakkı sende dursun
+      console.error(
+        `Suno generate hatası — HTTP ${sunoResponse.status}, cevap:`,
+        JSON.stringify(sunoData)
+      );
       return {
         statusCode: 502,
         body: JSON.stringify({
@@ -115,50 +117,14 @@ exports.handler = async (event) => {
       };
     }
 
-    // Bakiyeyi taskId'ye bağlı olarak kaydet — sunoCallback.js şarkı
-    // bittiğinde bunu okuyup gerçek harcanan krediyi hesaplayacak.
-    if (creditsBefore != null && COST_LOG_TABLE_NAME) {
-      const taskId = sunoData?.data?.taskId;
-      if (taskId) {
-        const nowSec = Math.floor(Date.now() / 1000);
-        await client.send(
-          new PutCommand({
-            TableName: COST_LOG_TABLE_NAME,
-            Item: {
-              taskId,
-              creditsBefore,
-              createdAt: new Date().toISOString(),
-              expiresAt: nowSec + 7 * 24 * 60 * 60, // 7 gün sonra TTL ile silinir
-            },
-          })
-        );
-      }
-    }
-
-    // 5) SADECE başarılı istekte kota bir arttırılır (atomik update)
-    await client.send(
-      new UpdateCommand({
-        TableName: TABLE_NAME,
-        Key: { userId },
-        UpdateExpression:
-          "SET usageCount = if_not_exists(usageCount, :zero) + :one, usagePeriod = :period, #plan = if_not_exists(#plan, :freePlan)",
-        ExpressionAttributeNames: {
-          "#plan": "plan",
-        },
-        ExpressionAttributeValues: {
-          ":one": 1,
-          ":zero": 0,
-          ":period": currentPeriod,
-          ":freePlan": "free",
-        },
-      })
-    );
+    // 4) SADECE Suno isteği başarılı olduktan sonra jeton düşülür
+    await deductCredits(userId, SONG_CREDIT_COST, creditCheck.used, creditCheck.currentPeriod);
 
     return {
       statusCode: 200,
       body: JSON.stringify({
         taskId: sunoData.data.taskId,
-        remainingQuota: limit - (usedThisPeriod + 1),
+        remainingCredits: creditCheck.remaining - SONG_CREDIT_COST,
       }),
     };
   } catch (err) {
