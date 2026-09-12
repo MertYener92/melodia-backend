@@ -24,6 +24,30 @@ Parameters:
   CloudFrontPrivateKeySecretArn:
     Type: String
     Description: Private key'i içeren Secrets Manager secret ARN'i.
+  AppleIapIssuerId:
+    Type: String
+    Default: "b5d98ed6-db6c-45fa-b55c-99cd1c8f61df"
+    Description: >
+      App Store Connect > Users and Access > Integrations > In-App
+      Purchase'dan alınan Issuer ID.
+  AppleIapKeyId:
+    Type: String
+    Default: "25V68W394G"
+    Description: >
+      Aynı yerden oluşturulan In-App Purchase API anahtarının Key ID'si.
+  AppleIapEnvironment:
+    Type: String
+    Default: "Sandbox"
+    AllowedValues: ["Sandbox", "Production"]
+    Description: >
+      TestFlight/sandbox test ederken "Sandbox", App Store'da canlıya
+      alınca "Production" yapıp sadece "sam deploy" ile değiştirilir.
+  AppleAppAppleId:
+    Type: String
+    Default: ""
+    Description: >
+      App Store Connect > App Information > Apple ID (sayısal). SADECE
+      Production ortamında zorunlu, Sandbox'ta boş bırakılabilir.
 
 Globals:
   Function:
@@ -580,6 +604,71 @@ Resources:
             Path: /account
             Method: delete
 
+  # ---------------------------------------------------------------
+  # YENİ (Madde 11 — Paywall): satın alma anında istemcinin gönderdiği
+  # imzalı Apple makbuzunu doğrulayıp kullanıcının planını günceller.
+  # Apple'ın RESMİ kütüphanesi (@apple/app-store-server-library)
+  # kullanılıyor — imza doğrulama elle yazılmıyor.
+  # ---------------------------------------------------------------
+  VerifySubscriptionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: verifySubscription.handler
+      Timeout: 20
+      Environment:
+        Variables:
+          APPLE_BUNDLE_ID: !Ref AppleBundleId
+          APPLE_IAP_ISSUER_ID: !Ref AppleIapIssuerId
+          APPLE_IAP_KEY_ID: !Ref AppleIapKeyId
+          APPLE_IAP_KEY_SECRET_ARN: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/apple-iap-private-key'
+          APPLE_IAP_ENVIRONMENT: !Ref AppleIapEnvironment
+          APPLE_APP_APPLE_ID: !Ref AppleAppAppleId
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/apple-iap-private-key-*'
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /subscription/verify
+            Method: post
+
+  # YENİ (Madde 11): Apple'ın App Store Server Notifications V2 webhook'u.
+  # Auth: NONE (Apple'ın sunucusu çağırıyor) ama güvenlik JWS imza
+  # doğrulamasından geliyor.
+  AppleNotificationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: appleNotifications.handler
+      Timeout: 20
+      Environment:
+        Variables:
+          APPLE_BUNDLE_ID: !Ref AppleBundleId
+          APPLE_IAP_ISSUER_ID: !Ref AppleIapIssuerId
+          APPLE_IAP_KEY_ID: !Ref AppleIapKeyId
+          APPLE_IAP_KEY_SECRET_ARN: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/apple-iap-private-key'
+          APPLE_IAP_ENVIRONMENT: !Ref AppleIapEnvironment
+          APPLE_APP_APPLE_ID: !Ref AppleAppAppleId
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/apple-iap-private-key-*'
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /apple-notifications
+            Method: post
+            Auth:
+              Authorizer: NONE
+
   # YENİ: API Gateway'in kendi, kaba/genel taşkın koruması. Kullanıcı bazlı
   # DEĞİL — tüm API için toplam saniyelik istek tavanı. rateLimit.js'teki
   # kullanıcı bazlı limitler "tek bir kullanıcı sistemi kötüye kullanamasın"
@@ -631,3 +720,9 @@ Outputs:
       Kalici olarak basarisiz olan (3 denemeden sonra) muzik uretim
       isleri buraya duser. Boyutu 0'dan buyukse manuel inceleme gerekir.
     Value: !Ref MusicGenerationDLQ
+  AppleNotificationsUrl:
+    Description: >
+      App Store Connect > App Information > App Store Server Notifications
+      kismindaki "Sandbox Server URL" ve/veya "Production Server URL"
+      alanina AYNEN bu degeri yapistir.
+    Value: !Sub "https://${MelodiaApi}.execute-api.${AWS::Region}.amazonaws.com/prod/apple-notifications"
