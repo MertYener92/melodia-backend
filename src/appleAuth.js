@@ -51,7 +51,18 @@ exports.handler = async (event) => {
       return { statusCode: 400, body: JSON.stringify({ error: "E-posta bilgisi alınamadı." }) };
     }
 
-    const username = `apple_${appleUserId}`;
+    // ÖNEMLİ: UserPool'da UsernameAttributes: [email] ayarı var — Cognito
+    // bu havuzda kullanıcı adının GERÇEK bir e-posta formatında olmasını
+    // zorunlu kılıyor. Önceden burada "apple_<appleUserId>" gibi e-posta
+    // olmayan bir kullanıcı adı kullanılıyordu, bu da Cognito tarafından
+    // "Username should be an email" hatasıyla reddediliyordu.
+    //
+    // DÜZELTME: e-postanın kendisini kullanıcı adı olarak kullanıyoruz.
+    // Bunun doğal bir sonucu var: aynı e-posta ile daha önce
+    // şifre/normal kayıt olan bir kullanıcı, Apple ile giriş yaptığında
+    // AYNI hesaba (aynı Cognito 'sub', dolayısıyla aynı jeton bakiyesi)
+    // giriş yapmış olur — bu, tek kişi/tek hesap için doğru davranış.
+    const username = email.toLowerCase();
 
     let userExists = true;
     try {
