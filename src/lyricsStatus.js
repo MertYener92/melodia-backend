@@ -1,7 +1,16 @@
 const { sunoFetch } = require("./sunoProxy");
+const { checkRateLimit, rateLimitResponse } = require("./rateLimit");
 
 exports.handler = async (event) => {
   try {
+    // HIZ SINIRI — status.js ile aynı mantık: bu da bir polling uç noktası,
+    // dakikada 60 istek normal kullanımı hiç etkilemez.
+    const userId = event.requestContext.authorizer.claims.sub;
+    const rl = await checkRateLimit(userId, "lyrics-status", 60, 60);
+    if (!rl.allowed) {
+      return rateLimitResponse(rl.retryAfterSeconds);
+    }
+
     const taskId = event.queryStringParameters?.taskId;
     if (!taskId) {
       return { statusCode: 400, body: JSON.stringify({ error: "taskId gerekli." }) };

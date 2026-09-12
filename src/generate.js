@@ -1,29 +1,20 @@
+const crypto = require("crypto");
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 const {
   DynamoDBDocumentClient,
   GetCommand,
-  UpdateCommand,
+  PutCommand,
 } = require("@aws-sdk/lib-dynamodb");
+const { SQSClient, SendMessageCommand } = require("@aws-sdk/client-sqs");
+const { checkRateLimit, rateLimitResponse } = require("./rateLimit");
+const { limitForPlan, currentPeriodKey } = require("./creditPlans");
 
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const sqs = new SQSClient({});
 const TABLE_NAME = process.env.TABLE_NAME;
-const SUNO_API_KEY = process.env.SUNO_API_KEY;
-const SUNO_BASE_URL = "https://api.sunoapi.org";
+const JOBS_TABLE_NAME = process.env.JOBS_TABLE_NAME;
+const GENERATION_QUEUE_URL = process.env.GENERATION_QUEUE_URL;
 const SONG_CREDIT_COST = Number(process.env.SONG_CREDIT_COST || 1);
-
-// BİRLEŞİK JETON HAVUZU — melodia-video (createVideoProject.js) ve
-// melodia-music-spec (app.py) ile AYNI alanları (aiCreditsUsed,
-// aiCreditsPeriod) kullanıyor, aynı UsersTable üzerinde. Şarkı, video,
-// music-spec artık tek bir "jeton" bakiyesinden düşüyor — eskiden burada
-// ayrı bir "usageCount" sayacı vardı, o tamamen kaldırıldı.
-//
-// TAHMINI DEGERLER — gercek maliyetler netlestikce ayarlanabilir.
-// Test asamasinda free plani pratik olarak sinirsiz.
-const AI_CREDIT_LIMITS = {
-  free: Number.MAX_SAFE_INTEGER,
-  basic_monthly: 100,
-  pro_monthly: 300,
-};
 
 async function checkCreditsAvailable(userId, cost) {
   const { Item: user } = await client.send(
@@ -31,37 +22,49 @@ async function checkCreditsAvailable(userId, cost) {
   );
 
   const now = new Date();
-  const currentPeriod = `${now.getFullYear()}-${now.getMonth() + 1}`;
-  const plan = user?.plan || "free";
-  const limit = AI_CREDIT_LIMITS[plan] ?? AI_CREDIT_LIMITS.free;
+
+  // SAVUNMA KATMANI (madde 11 — paywall): Apple'ın webhook'u bir sebeple
+  // gecikirse ya da hiç gelmezse diye SADECE ona güvenmiyoruz — abonelik
+  // süresi (planExpiresAt) burada da kontrol ediliyor. Süresi geçmiş bir
+  // "pro" kullanıcı otomatik olarak free limitine düşer.
+  const isExpired = user?.planExpiresAt && new Date(user.planExpiresAt) < now;
+  const plan = isExpired ? "free" : user?.plan || "free";
+
+  const limit = limitForPlan(plan);
+  const currentPeriod = currentPeriodKey(plan, now);
   const used = user?.aiCreditsPeriod === currentPeriod ? (user.aiCreditsUsed || 0) : 0;
 
   return { allowed: used + cost <= limit, remaining: Math.max(limit - used, 0), used, currentPeriod };
 }
 
-async function deductCredits(userId, cost, used, currentPeriod) {
-  await client.send(
-    new UpdateCommand({
-      TableName: TABLE_NAME,
-      Key: { userId },
-      UpdateExpression:
-        "SET aiCreditsUsed = :newUsed, aiCreditsPeriod = :period, #plan = if_not_exists(#plan, :freePlan)",
-      ExpressionAttributeNames: { "#plan": "plan" },
-      ExpressionAttributeValues: {
-        ":newUsed": used + cost,
-        ":period": currentPeriod,
-        ":freePlan": "free",
-      },
-    })
-  );
-}
-
+// DİKKAT — DAVRANIŞ DEĞİŞİKLİĞİ:
+// Eskiden bu fonksiyon Suno'yu SENKRON çağırıp cevabı bekliyordu; Suno
+// geçici bir hata verdiğinde (ağ sorunu, 5xx, timeout) kullanıcıya direkt
+// 502 dönüyorduk ve otomatik yeniden deneme yoktu.
+//
+// YENİ: Suno'ya gerçek istek burada ATILMIYOR. Sadece jeton kontrolü
+// yapılıp iş kaydı (job) DynamoDB'ye yazılıyor ve SQS kuyruğuna bir
+// mesaj bırakılıyor. Asıl Suno çağrısını processMusicGeneration.js
+// (kuyruktan tetiklenen ayrı bir Lambda) yapıyor — video projesindeki
+// startAssembly.js / AssemblyQueue deseninin birebir aynısı. Böylece:
+//  - Suno geçici hata verirse SQS otomatik olarak yeniden dener
+//  - 3 denemeden sonra hâlâ başarısızsa mesaj MusicGenerationDLQ'ya düşer
+//  - jeton, Suno isteği gerçekten kabul edildiğinde (worker içinde) düşülür
 exports.handler = async (event) => {
   try {
-    // 1) Kullanıcı kim? (Cognito token'ından otomatik gelir, taklit edilemez)
+    // 1) Kullanıcı kim?
     const userId = event.requestContext.authorizer.claims.sub;
 
-    // 2) JETON KONTROLÜ — Suno'ya hiç istek atmadan önce, asıl güvenlik burada
+    // 1.5) HIZ SINIRI — jeton kontrolüne (DynamoDB okuma) bile gitmeden önce
+    // en ucuz ve en hızlı reddi burada yapıyoruz. /generate pahalı bir uç
+    // nokta (gerçek para harcıyor), bu yüzden limiti sıkı tutuyoruz: bir
+    // kullanıcı dakikada en fazla 5 üretim isteği başlatabilir.
+    const rl = await checkRateLimit(userId, "generate", 5, 60);
+    if (!rl.allowed) {
+      return rateLimitResponse(rl.retryAfterSeconds);
+    }
+
+    // 2) JETON KONTROLÜ — kuyruğa hiç yazmadan önce hızlıca reddet
     const creditCheck = await checkCreditsAvailable(userId, SONG_CREDIT_COST);
     if (!creditCheck.allowed) {
       return {
@@ -73,57 +76,47 @@ exports.handler = async (event) => {
       };
     }
 
-    // 3) Kota uygunsa, isteği request body'den al ve Suno'ya ilet
     const body = JSON.parse(event.body || "{}");
-
-    // Suno bu alanı zorunlu tutuyor; sonucu zaten /status ile polling
-    // yaptığımız için kendi no-op callback uç noktamızı, gelen isteğin
-    // kendi adresinden anlık olarak hesaplıyoruz (CloudFormation'da sabit
-    // tanımlarsak döngüsel bağımlılık oluşur, bu yüzden runtime'da kuruyoruz).
     const callBackUrl = `https://${event.headers.Host}/${event.requestContext.stage}/suno-callback`;
+    const jobId = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
 
-    const sunoResponse = await fetch(`${SUNO_BASE_URL}/api/v1/generate`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${SUNO_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        customMode: true,
-        instrumental: body.instrumental ?? false,
-        prompt: body.lyrics,
-        style: body.style,
-        title: body.title,
-        model: "V5_5",
-        callBackUrl,
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
+    // 3) İş kaydı oluştur (henüz Suno'ya hiçbir şey gönderilmedi)
+    await client.send(
+      new PutCommand({
+        TableName: JOBS_TABLE_NAME,
+        Item: {
+          jobId,
+          userId,
+          status: "queued", // queued -> submitting -> ready | failed
+          payload: {
+            lyrics: body.lyrics,
+            style: body.style,
+            title: body.title,
+            instrumental: body.instrumental ?? false,
+          },
+          callBackUrl,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          expiresAt: Math.floor(Date.now() / 1000) + 60 * 60 * 24, // 24 saat sonra TTL ile silinir
+        },
+      })
+    );
 
-    const sunoData = await sunoResponse.json();
-
-    if (!sunoResponse.ok || sunoData.code !== 200) {
-      // Suno hata verdiyse kullanıcının jetonunu DÜŞÜRME — hakkı sende dursun
-      console.error(
-        `Suno generate hatası — HTTP ${sunoResponse.status}, cevap:`,
-        JSON.stringify(sunoData)
-      );
-      return {
-        statusCode: 502,
-        body: JSON.stringify({
-          error: "suno_error",
-          message: sunoData.msg || "Şarkı üretimi başlatılamadı.",
-        }),
-      };
-    }
-
-    // 4) SADECE Suno isteği başarılı olduktan sonra jeton düşülür
-    await deductCredits(userId, SONG_CREDIT_COST, creditCheck.used, creditCheck.currentPeriod);
+    // 4) Kuyruğa at — mesaj küçük tutuluyor (jobId yeter), worker detayı
+    // tablodan okuyor. Video projesiyle aynı yaklaşım.
+    await sqs.send(
+      new SendMessageCommand({
+        QueueUrl: GENERATION_QUEUE_URL,
+        MessageBody: JSON.stringify({ jobId }),
+      })
+    );
 
     return {
-      statusCode: 200,
+      statusCode: 202,
       body: JSON.stringify({
-        taskId: sunoData.data.taskId,
+        jobId,
+        status: "queued",
         remainingCredits: creditCheck.remaining - SONG_CREDIT_COST,
       }),
     };

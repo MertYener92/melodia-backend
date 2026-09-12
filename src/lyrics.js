@@ -1,7 +1,15 @@
 const { sunoFetch } = require("./sunoProxy");
+const { checkRateLimit, rateLimitResponse } = require("./rateLimit");
 
 exports.handler = async (event) => {
   try {
+    // HIZ SINIRI — bir kullanıcı dakikada en fazla 10 söz üretim isteği başlatabilir.
+    const userId = event.requestContext.authorizer.claims.sub;
+    const rl = await checkRateLimit(userId, "lyrics", 10, 60);
+    if (!rl.allowed) {
+      return rateLimitResponse(rl.retryAfterSeconds);
+    }
+
     const body = JSON.parse(event.body || "{}");
     // Suno bu alanı zorunlu tutuyor; içeriğiyle ilgilenmiyoruz, sonucu
     // /lyrics-status ile polling yapıyoruz. URL'i gelen isteğin kendi

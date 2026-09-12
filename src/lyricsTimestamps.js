@@ -1,3 +1,5 @@
+const { checkRateLimit, rateLimitResponse } = require("./rateLimit");
+
 const SUNO_API_KEY = process.env.SUNO_API_KEY;
 const SUNO_BASE_URL = "https://api.sunoapi.org";
 
@@ -5,6 +7,13 @@ const SUNO_BASE_URL = "https://api.sunoapi.org";
 // çeker. Kota harcamaz — zaten üretilmiş bir şarkının ek bir bilgisidir.
 exports.handler = async (event) => {
   try {
+    // HIZ SINIRI — jeton harcamıyor ama yine de Suno'ya gerçek istek atıyor.
+    const userId = event.requestContext.authorizer.claims.sub;
+    const rl = await checkRateLimit(userId, "lyrics-timestamps", 15, 60);
+    if (!rl.allowed) {
+      return rateLimitResponse(rl.retryAfterSeconds);
+    }
+
     const body = JSON.parse(event.body || "{}");
     const { taskId, audioId } = body;
 

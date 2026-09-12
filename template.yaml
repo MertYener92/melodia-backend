@@ -73,6 +73,72 @@ Resources:
         AttributeName: expiresAt
         Enabled: true
 
+  # YENİ: Şarkı üretim işlerinin (job) durumunu tutan tablo. generate.js
+  # Suno'ya artık DOĞRUDAN istek atmıyor — burada "queued" bir kayıt
+  # oluşturup MusicGenerationQueue'ya yazıyor. processMusicGeneration.js
+  # (worker) bu kaydı okuyup Suno'yu çağırıyor ve sonucu (ready/failed +
+  # taskId) buraya yazıyor. Flutter istemcisi /status?jobId=... ile bu
+  # tabloyu pollar. TTL ile 24 saat sonra otomatik silinir.
+  GenerationJobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: melodia-generation-jobs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  # ---------------------------------------------------------------
+  # YENİ: Müzik üretim kuyruğu (SQS). generate.js artık Suno'yu
+  # SENKRON çağırmıyor, sadece bu kuyruğa yazıyor. Böylece:
+  #  - processMusicGeneration bir istisna fırlatırsa (Suno 5xx/429/
+  #    timeout gibi geçici hatalar) SQS otomatik olarak yeniden dener
+  #    (visibility timeout dolunca)
+  #  - maxReceiveCount (3) denemeden sonra hâlâ başarısızsa mesaj
+  #    kendiliğinden MusicGenerationDLQ'ya (dead-letter queue) düşer
+  #  - melodia-video'daki AssemblyQueue/AssemblyDLQ ile BİREBİR AYNI
+  #    desen kullanılıyor
+  # ---------------------------------------------------------------
+  MusicGenerationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: melodia-music-generation-dlq
+      MessageRetentionPeriod: 1209600 # 14 gün
+
+  MusicGenerationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: melodia-music-generation-queue
+      VisibilityTimeout: 90 # ProcessMusicGenerationFunction Timeout'undan (60s) biraz fazla
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MusicGenerationDLQ.Arn
+        maxReceiveCount: 3
+
+  # YENİ: Kullanıcı bazlı hız sınırlama (rate limiting) için sayaç tablosu.
+  # rateLimit.js bu tabloyu "sabit pencereli" bir sayaç olarak kullanıyor —
+  # her (kullanıcı, uç nokta, zaman dilimi) için atomik bir sayaç tutuluyor.
+  # TTL ile pencere kapanınca otomatik silinir, elle temizlik gerekmez.
+  RateLimitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: melodia-rate-limits
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: rateLimitKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: rateLimitKey
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
   SongsTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -181,19 +247,30 @@ Resources:
         - ALLOW_REFRESH_TOKEN_AUTH
         - ALLOW_ADMIN_USER_PASSWORD_AUTH
 
+  # DEĞİŞTİ: Artık Suno'yu doğrudan çağırmıyor — sadece jeton kontrolü
+  # yapıp bir job kaydı oluşturuyor ve MusicGenerationQueue'ya yazıyor.
+  # Bu yüzden Timeout kısaltıldı (ağır iş artık burada değil).
   GenerateSongFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
       Handler: generate.handler
+      Timeout: 15
       Environment:
         Variables:
           SONG_CREDIT_COST: !Ref SongCreditCost
+          JOBS_TABLE_NAME: !Ref GenerationJobsTable
+          GENERATION_QUEUE_URL: !Ref MusicGenerationQueue
+          RATE_LIMIT_TABLE_NAME: !Ref RateLimitTable
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GenerationJobsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RateLimitTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt MusicGenerationQueue.QueueName
       Events:
         Api:
           Type: Api
@@ -202,14 +279,48 @@ Resources:
             Path: /generate
             Method: post
 
+  # YENİ: MusicGenerationQueue'dan tetiklenen worker. Asıl Suno /generate
+  # çağrısını burada yapıyoruz. Suno geçici hata verirse (5xx/429/timeout)
+  # istisna fırlatılır ve SQS otomatik yeniden dener; kalıcı hatalarda
+  # (ör. içerik reddi) job doğrudan "failed" işaretlenir, tekrar denenmez.
+  # Jeton SADECE Suno isteği kabul edildiğinde burada düşülüyor.
+  ProcessMusicGenerationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: processMusicGeneration.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          SONG_CREDIT_COST: !Ref SongCreditCost
+          JOBS_TABLE_NAME: !Ref GenerationJobsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GenerationJobsTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+      Events:
+        GenerationQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MusicGenerationQueue.Arn
+            BatchSize: 1
+
   LyricsFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
       Handler: lyrics.handler
+      Environment:
+        Variables:
+          RATE_LIMIT_TABLE_NAME: !Ref RateLimitTable
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RateLimitTable
       Events:
         Api:
           Type: Api
@@ -223,9 +334,14 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: lyricsStatus.handler
+      Environment:
+        Variables:
+          RATE_LIMIT_TABLE_NAME: !Ref RateLimitTable
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RateLimitTable
       Events:
         Api:
           Type: Api
@@ -234,14 +350,25 @@ Resources:
             Path: /lyrics-status
             Method: get
 
+  # DEĞİŞTİ: Artık jobId (queued/submitting/failed/ready) VEYA taskId
+  # (Suno'nun kendi durumu) ile sorgulanabiliyor. GenerationJobsTable
+  # okuma izni ve tablo adı eklendi.
   StatusFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
       Handler: status.handler
+      Environment:
+        Variables:
+          JOBS_TABLE_NAME: !Ref GenerationJobsTable
+          RATE_LIMIT_TABLE_NAME: !Ref RateLimitTable
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+        - DynamoDBReadPolicy:
+            TableName: !Ref GenerationJobsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RateLimitTable
       Events:
         Api:
           Type: Api
@@ -318,9 +445,14 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: lyricsTimestamps.handler
+      Environment:
+        Variables:
+          RATE_LIMIT_TABLE_NAME: !Ref RateLimitTable
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RateLimitTable
       Events:
         Api:
           Type: Api
@@ -448,10 +580,20 @@ Resources:
             Path: /account
             Method: delete
 
+  # YENİ: API Gateway'in kendi, kaba/genel taşkın koruması. Kullanıcı bazlı
+  # DEĞİL — tüm API için toplam saniyelik istek tavanı. rateLimit.js'teki
+  # kullanıcı bazlı limitler "tek bir kullanıcı sistemi kötüye kullanamasın"
+  # içinken, bu ayar "API'nin tamamı aniden binlerce istekle boğulmasın"
+  # (ör. bir DDoS denemesi) için ilk savunma hattı. İkisi birlikte çalışıyor.
   MelodiaApi:
     Type: AWS::Serverless::Api
     Properties:
       StageName: prod
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: 20 # saniyede sürekli izin verilen ortalama istek sayısı (tüm API, tüm kullanıcılar toplamı)
+          ThrottlingBurstLimit: 40 # anlık patlamalarda (ör. birkaç kullanıcı aynı anda) tolerans
       Cors:
         AllowMethods: "'GET,POST,DELETE,OPTIONS'"
         AllowHeaders: "'Content-Type,Authorization'"
@@ -484,3 +626,8 @@ Outputs:
     Value: !GetAtt UsersTable.Arn
     Export:
       Name: melodia-users-table-arn
+  MusicGenerationDLQUrl:
+    Description: >
+      Kalici olarak basarisiz olan (3 denemeden sonra) muzik uretim
+      isleri buraya duser. Boyutu 0'dan buyukse manuel inceleme gerekir.
+    Value: !Ref MusicGenerationDLQ
