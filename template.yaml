@@ -669,6 +669,35 @@ Resources:
             Auth:
               Authorizer: NONE
 
+  # GEÇİCİ — SADECE TEST: webhook kurulumunu doğruladıktan sonra bu
+  # fonksiyonu ve requestTestNotification.js dosyasını silebilirsin.
+  RequestTestNotificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: requestTestNotification.handler
+      Timeout: 20
+      Environment:
+        Variables:
+          APPLE_BUNDLE_ID: !Ref AppleBundleId
+          APPLE_IAP_ISSUER_ID: !Ref AppleIapIssuerId
+          APPLE_IAP_KEY_ID: !Ref AppleIapKeyId
+          APPLE_IAP_KEY_SECRET_ARN: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/apple-iap-private-key'
+          APPLE_IAP_ENVIRONMENT: !Ref AppleIapEnvironment
+          APPLE_APP_APPLE_ID: !Ref AppleAppAppleId
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/apple-iap-private-key-*'
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /test-apple-notification
+            Method: get
+            Auth:
+              Authorizer: NONE
+
   # YENİ: API Gateway'in kendi, kaba/genel taşkın koruması. Kullanıcı bazlı
   # DEĞİL — tüm API için toplam saniyelik istek tavanı. rateLimit.js'teki
   # kullanıcı bazlı limitler "tek bir kullanıcı sistemi kötüye kullanamasın"

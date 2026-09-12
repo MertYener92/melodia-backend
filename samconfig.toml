@@ -4,10 +4,9 @@ version = 0.1
 stack_name = "melodia-backend"
 resolve_s3 = true
 s3_prefix = "melodia-backend"
-region = "eu-north-1"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
 image_repositories = []
-
+parameter_overrides = "AppleBundleId=\"com.mertyener.melodia\" SongCreditCost=\"1\" AppleIapIssuerId=\"b5d98ed6-db6c-45fa-b55c-99cd1c8f61df\" AppleIapKeyId=\"25V68W394G\" AppleIapEnvironment=\"Sandbox\" AppleAppAppleId=\"\""
 [default.global.parameters]
 region = "eu-north-1"
