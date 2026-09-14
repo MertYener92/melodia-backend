@@ -58,6 +58,7 @@ Globals:
       Variables:
         TABLE_NAME: !Ref UsersTable
         SUNO_API_KEY: '{{resolve:secretsmanager:melodia/suno-api-key}}'
+        GEMINI_API_KEY: '{{resolve:secretsmanager:melodia/gemini-api-key}}'
         SONGS_TABLE_NAME: !Ref SongsTable
         AUDIO_BUCKET_NAME: !Ref AudioBucket
         CLOUDFRONT_DOMAIN: !GetAtt AudioDistribution.DomainName
@@ -139,7 +140,7 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: melodia-music-generation-queue
-      VisibilityTimeout: 90 # ProcessMusicGenerationFunction Timeout'undan (60s) biraz fazla
+      VisibilityTimeout: 180 # DÜZELTME: ProcessMusicGenerationFunction'ın yeni Timeout'undan (150s) biraz fazla -- Lyria isteği hâlâ işlenirken SQS'in mesajı erken yeniden teslim edip ÇİFT ücretlendirmesini önler.
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt MusicGenerationDLQ.Arn
         maxReceiveCount: 3
@@ -313,18 +314,28 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: processMusicGeneration.handler
-      Timeout: 60
+      # DÜZELTME (Lyria entegrasyonu): 60sn'den 150sn'ye çıkarıldı --
+      # Lyria 3.5 tam şarkı üretimi Suno'dan daha uzun sürebiliyor
+      # (lyriaProxy.js'teki HTTP timeout 120sn), + S3 yükleme + DB
+      # yazmaları için pay bırakıldı. Suno dalı zaten çok daha hızlı
+      # kabul ediyor, bu üst sınır ona zarar vermez.
+      Timeout: 150
       Environment:
         Variables:
           SONG_CREDIT_COST: !Ref SongCreditCost
           JOBS_TABLE_NAME: !Ref GenerationJobsTable
+          AUDIO_BUCKET_NAME: !Ref AudioBucket
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
         - DynamoDBCrudPolicy:
             TableName: !Ref GenerationJobsTable
+        - S3CrudPolicy:
+            BucketName: !Ref AudioBucket
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/gemini-api-key-*'
       Events:
         GenerationQueueEvent:
           Type: SQS

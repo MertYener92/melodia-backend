@@ -81,19 +81,33 @@ exports.handler = async (event) => {
     const jobId = crypto.randomUUID();
     const nowIso = new Date().toISOString();
 
-    // 3) İş kaydı oluştur (henüz Suno'ya hiçbir şey gönderilmedi)
+    // YENİ: hangi motor kullanılacak ('suno' | 'lyria'). Verilmezse ya da
+    // tanınmayan bir değerse eskisi gibi 'suno' varsayılır -- mevcut
+    // istemciler (henüz güncellenmemiş uygulama sürümleri) hiçbir
+    // değişiklik olmadan çalışmaya devam eder.
+    const provider = body.provider === "lyria" ? "lyria" : "suno";
+
+    // 3) İş kaydı oluştur (henüz Suno'ya/Lyria'ya hiçbir şey gönderilmedi)
     await client.send(
       new PutCommand({
         TableName: JOBS_TABLE_NAME,
         Item: {
           jobId,
           userId,
+          provider,
           status: "queued", // queued -> submitting -> ready | failed
           payload: {
             lyrics: body.lyrics,
             style: body.style,
             title: body.title,
             instrumental: body.instrumental ?? false,
+            // YENİ: Lyria prompt'u oluştururken kullanılıyor (Suno dalı
+            // bu iki alanı zaten okumuyor, ekstra bulunmaları zararsız).
+            vocalGender: body.vocalGender || null,
+            durationSeconds: body.durationSeconds || null,
+            // YENİ: Lyria'nın sözleri doğru dilde yazması için (bkz.
+            // processMusicGeneration.js -> buildLyriaPrompt).
+            lyricsLanguage: body.lyricsLanguage || null,
           },
           callBackUrl,
           createdAt: nowIso,

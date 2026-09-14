@@ -49,7 +49,35 @@ exports.handler = async (event) => {
         };
       }
 
-      // job.status === "ready" -> Suno'nun kendi durumunu sormaya devam ediyoruz
+      // YENİ (Lyria): Suno'nun aksine tekrar sorgulanacak bir dış "taskId"
+      // yok -- sonuç zaten worker tarafından job kaydına yazıldı
+      // (bkz. processMusicGeneration.js -> markReadyWithResult). Flutter'ın
+      // beklediği GenerationTask.fromJson şeklini burada birebir üretiyoruz,
+      // Suno'ya hiç gitmeden.
+      if (job.status === "ready" && job.provider === "lyria") {
+        return {
+          statusCode: 200,
+          body: JSON.stringify({
+            status: "SUCCESS",
+            taskId: job.jobId,
+            response: {
+              sunoData: [
+                {
+                  id: job.jobId,
+                  title: job.resultTitle,
+                  prompt: job.payload?.lyrics || job.resultLyrics || "",
+                  audioUrl: job.resultAudioUrl,
+                  streamAudioUrl: job.resultAudioUrl,
+                  imageUrl: "",
+                  duration: job.payload?.durationSeconds ?? null,
+                },
+              ],
+            },
+          }),
+        };
+      }
+
+      // job.status === "ready" (Suno) -> Suno'nun kendi durumunu sormaya devam ediyoruz
       taskId = job.taskId;
     }
 

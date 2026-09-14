@@ -1,4 +1,5 @@
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const s3 = new S3Client({});
 const AUDIO_BUCKET_NAME = process.env.AUDIO_BUCKET_NAME;
@@ -17,7 +18,17 @@ async function copyExternalAudioToS3(externalUrl, userId, songId) {
     throw new Error(`Ses dosyası indirilemedi (HTTP ${res.status}).`);
   }
   const buffer = Buffer.from(await res.arrayBuffer());
+  return uploadAudioBufferToS3(buffer, userId, songId);
+}
 
+/// YENİ (Lyria entegrasyonu): Suno'dan farklı olarak Lyria bize hazır bir
+/// URL değil, doğrudan base64 ses BAYTLARINI döndürüyor -- indirilecek bir
+/// dış URL yok. Bu yüzden copyExternalAudioToS3'ün "fetch" adımını atlayıp
+/// doğrudan S3'e yazan bu küçük yardımcıyı ekliyoruz. Anahtar (key)
+/// deseni copyExternalAudioToS3 ile BİREBİR aynı -- saveSong.js ve
+/// getSongPlayUrl.js hangi ses sağlayıcısından geldiğini hiç bilmesine
+/// gerek kalmadan çalışmaya devam eder.
+async function uploadAudioBufferToS3(buffer, userId, songId) {
   const key = `songs/${userId}/${songId}.mp3`;
   await s3.send(
     new PutObjectCommand({
@@ -27,8 +38,22 @@ async function copyExternalAudioToS3(externalUrl, userId, songId) {
       ContentType: "audio/mpeg",
     })
   );
-
   return key;
 }
 
-module.exports = { copyExternalAudioToS3 };
+/// YENİ (Lyria entegrasyonu): Lyria job'ı "ready" olur olmaz -- kullanıcı
+/// henüz kütüphanesine KAYDETMEDEN, sadece GeneratingScreen'de dinleyip
+/// kütüphaneye eklerken -- oynatılabilir bir URL'e ihtiyaç var (Suno'da bu
+/// rolü Suno'nun kendi geçici CDN URL'i oynuyordu). AudioBucket tamamen
+/// private olduğu için (bkz. template.yaml PublicAccessBlockConfiguration),
+/// burada kısa ömürlü (24 saatlik -- kullanıcının şarkıyı dinleyip
+/// kaydetmesine fazlasıyla yetecek kadar) bir S3 presigned GET URL
+/// üretiyoruz. Kullanıcı şarkıyı kütüphanesine kaydederse saveSong.js zaten
+/// bu URL'den indirip KENDİ kalıcı key'ine tekrar kopyalayacak (Suno
+/// akışıyla birebir aynı davranış).
+async function getPresignedAudioUrl(key, expiresInSeconds = 60 * 60 * 24) {
+  const command = new GetObjectCommand({ Bucket: AUDIO_BUCKET_NAME, Key: key });
+  return getSignedUrl(s3, command, { expiresIn: expiresInSeconds });
+}
+
+module.exports = { copyExternalAudioToS3, uploadAudioBufferToS3, getPresignedAudioUrl };

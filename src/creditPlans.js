@@ -12,7 +12,13 @@
 //    bir "yenileme" bildirimi göndermesine gerek YOK, sıfırlama tamamen
 //    bizim tarafımızda, tarihe bakarak, tembel (lazy) şekilde hesaplanıyor)
 const AI_CREDIT_LIMITS = {
-  free: Number.MAX_SAFE_INTEGER,
+  // DÜZELTME: Önceden Number.MAX_SAFE_INTEGER'dı -- yani abonesi
+  // olmayan/süresi geçmiş kullanıcı pratikte SINIRSIZ şarkı üretebiliyordu.
+  // Artık "free" gerçek bir ömür boyu TEK SEFERLİK deneme jetonu:
+  // kullanıcı 1 şarkı üretebilir, sonra Pro'ya geçmeden bir daha
+  // üretemez. Bu periyodik (haftalık/aylık) sıfırlanmıyor -- bkz.
+  // currentPeriodKey'deki "lifetime" özel durumu.
+  free: 1,
   pro_weekly: 25,
   pro_monthly: 120,
   pro_yearly: 120,
@@ -42,6 +48,12 @@ function isoWeekKey(date) {
 // monthly'ye geçince) elle bir "geçiş" kodu yazmaya gerek yok, doğal
 // olarak temiz bir sayfa açılıyor.
 function currentPeriodKey(plan, now = new Date()) {
+  // DÜZELTME: "free" artık AYLIK sıfırlanan bir dönem DEĞİL -- sabit bir
+  // "lifetime" anahtarı dönüyor, böylece tek seferlik 1 jeton kullanılınca
+  // bir daha ASLA (ay değişse bile) yenilenmiyor. Kullanıcı Pro'ya
+  // geçtiğinde plan değişeceği için (pro_weekly/monthly/yearly) bu dal
+  // zaten devreye girmeyecek, doğal olarak temiz bir sayfa açılacak.
+  if (plan === "free") return "lifetime";
   if (plan === "pro_weekly") return isoWeekKey(now);
   return `${now.getFullYear()}-${now.getMonth() + 1}`;
 }
