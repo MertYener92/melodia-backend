@@ -6,3 +6,9 @@
 npm-debug.log*
 .vscode/
 .idea/
+
+apple-auth-env*.json
+verify-sub-env*.json
+live-*.json
+live-*.txt
+gercek-deployed-template.json

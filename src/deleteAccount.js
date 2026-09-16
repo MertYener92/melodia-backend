@@ -26,6 +26,15 @@ const USER_POOL_ID = process.env.USER_POOL_ID;
 // S3'ümüzde duran ses dosyaları), video projeleri (+ S3'teki fotoğraf/video
 // dosyaları), kota kaydı ve en sonunda Cognito hesabının kendisi.
 // Apple App Store'un zorunlu tuttuğu "hesabımı sil" kuralı için gerekli.
+//
+// BİLİNÇLİ OLARAK SİLİNMEYEN BİR ŞEY VAR: melodia-free-trial-ledger
+// tablosu (appleUserIdHash -> claimedAt). Bu tablo BURADA SİLİNMEMELİ --
+// amacı tam olarak, hesap silinip AYNI Apple kimliğiyle yeniden
+// kaydolunduğunda ücretsiz jetonun sessizce yeniden kazanılmasını
+// ENGELLEMEK (bkz. creditReservation.js -> claimFreeTrialOrThrow).
+// Apple'ın "hesabı sil" kuralına aykırı değil çünkü bu tabloda İSİM,
+// E-POSTA ya da başka bir kişisel veri YOK -- sadece opak bir hash +
+// zaman damgası.
 exports.handler = async (event) => {
   try {
     const claims = event.requestContext.authorizer.claims;

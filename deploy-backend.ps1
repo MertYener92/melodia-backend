@@ -16,7 +16,7 @@ $ErrorActionPreference = "Stop"
 
 # ---- BURAYI DOLDUR ----
 $stackName     = "melodia-backend"          # ornek: melodia-backend
-$appleBundleId = "com.melodia.app"                  # degismediyse dokunma
+$appleBundleId = "com.mertyener.melodia"                  # degismediyse dokunma
 # ------------------------
 
 $publicKeyPem = "$(Get-Content -Raw -Path '.\..\..\audio-public-key.pem')"

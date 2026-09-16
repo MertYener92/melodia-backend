@@ -8,6 +8,7 @@ const { sunoFetch } = require("./sunoProxy");
 const { lyriaGenerate } = require("./lyriaProxy");
 const { uploadAudioBufferToS3, getPresignedAudioUrl } = require("./audioStorage");
 const { currentPeriodKey } = require("./creditPlans");
+const { initSunoStatusCache } = require("./sunoStatusCache");
 
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const TABLE_NAME = process.env.TABLE_NAME; // UsersTable — jeton düşmek için
@@ -346,6 +347,12 @@ exports.handler = async (event) => {
       // Suno isteği kabul etti — SADECE ŞİMDİ jeton düşülüyor
       await deductCredits(job.userId, SONG_CREDIT_COST);
       await markReady(jobId, data.data.taskId);
+      // YENİ: webhook/cache alanlarını PENDING'e kur -- sunoCallback.js
+      // (Suno'nun webhook'u) ve status.js'in güvenlik-ağı poll'u bundan
+      // sonra bu alanları güncelleyecek. status.js artık bu noktadan
+      // sonra, webhook gelene kadar Suno'yu HER pollamada değil, en
+      // fazla 18sn'de bir sorgulayacak (bkz. sunoStatusCache.js).
+      await initSunoStatusCache(jobId);
     } catch (err) {
       console.error(`Job ${jobId} işleme hatası:`, err);
       throw err; // SQS retry/DLQ mekanizmasını tetikle

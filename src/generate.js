@@ -1,93 +1,78 @@
 const crypto = require("crypto");
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
-const {
-  DynamoDBDocumentClient,
-  GetCommand,
-  PutCommand,
-} = require("@aws-sdk/lib-dynamodb");
+const { DynamoDBDocumentClient, PutCommand } = require("@aws-sdk/lib-dynamodb");
 const { SQSClient, SendMessageCommand } = require("@aws-sdk/client-sqs");
 const { checkRateLimit, rateLimitResponse } = require("./rateLimit");
-const { limitForPlan, currentPeriodKey } = require("./creditPlans");
+const { reserveCredits, refundCreditsStandalone, QuotaExceededError } = require("./creditReservation");
 
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const sqs = new SQSClient({});
-const TABLE_NAME = process.env.TABLE_NAME;
 const JOBS_TABLE_NAME = process.env.JOBS_TABLE_NAME;
-const GENERATION_QUEUE_URL = process.env.GENERATION_QUEUE_URL;
+// YENİ (madde 8 — ayrı Suno/Lyria kuyrukları): provider'a göre doğru
+// kuyruğa yönlendiriyoruz, böylece uzun süren Lyria job'ları Suno'nun
+// hızlı submission akışının Lambda concurrency slotlarını tüketemez.
+const GENERATION_QUEUE_URL = process.env.GENERATION_QUEUE_URL; // Suno
+const LYRIA_GENERATION_QUEUE_URL = process.env.LYRIA_GENERATION_QUEUE_URL;
 const SONG_CREDIT_COST = Number(process.env.SONG_CREDIT_COST || 1);
+// YENİ (madde 6 — webhook authentication): Suno/Lyria bize dönerken
+// callBackUrl'e eklenen paylaşılan secret. Global env değişkeni olarak
+// Secrets Manager'dan deploy anında çözülüyor (SUNO_API_KEY ile aynı
+// desen) -- koda asla açık yazılmıyor, hiçbir yerde loglanmıyor.
+const SUNO_CALLBACK_SECRET = process.env.SUNO_CALLBACK_SECRET;
 
-async function checkCreditsAvailable(userId, cost) {
-  const { Item: user } = await client.send(
-    new GetCommand({ TableName: TABLE_NAME, Key: { userId } })
-  );
-
-  const now = new Date();
-
-  // SAVUNMA KATMANI (madde 11 — paywall): Apple'ın webhook'u bir sebeple
-  // gecikirse ya da hiç gelmezse diye SADECE ona güvenmiyoruz — abonelik
-  // süresi (planExpiresAt) burada da kontrol ediliyor. Süresi geçmiş bir
-  // "pro" kullanıcı otomatik olarak free limitine düşer.
-  const isExpired = user?.planExpiresAt && new Date(user.planExpiresAt) < now;
-  const plan = isExpired ? "free" : user?.plan || "free";
-
-  const limit = limitForPlan(plan);
-  const currentPeriod = currentPeriodKey(plan, now);
-  const used = user?.aiCreditsPeriod === currentPeriod ? (user.aiCreditsUsed || 0) : 0;
-
-  return { allowed: used + cost <= limit, remaining: Math.max(limit - used, 0), used, currentPeriod };
-}
-
-// DİKKAT — DAVRANIŞ DEĞİŞİKLİĞİ:
-// Eskiden bu fonksiyon Suno'yu SENKRON çağırıp cevabı bekliyordu; Suno
-// geçici bir hata verdiğinde (ağ sorunu, 5xx, timeout) kullanıcıya direkt
-// 502 dönüyorduk ve otomatik yeniden deneme yoktu.
+// DİKKAT — DAVRANIŞ DEĞİŞİKLİĞİ (FINAL PRODUCTION HARDENING, madde 1):
+// Kredi artık worker'da (Suno/Lyria isteği kabul edildiğinde) DEĞİL,
+// BURADA, job kuyruğa yazılmadan ÖNCE, ATOMİK olarak rezerve ediliyor
+// (bkz. creditReservation.js). Bu, aynı kullanıcının eşzamanlı (çift
+// dokunma, çoklu cihaz) isteklerinin ikisinin de kotayı "boşta" görüp
+// ikisinin de geçmesi (TOCTOU) riskini TAMAMEN kapatır: reserveCredits
+// tek bir koşullu DynamoDB yazması olduğu için iki eşzamanlı istekten
+// SADECE biri başarılı olabilir.
 //
-// YENİ: Suno'ya gerçek istek burada ATILMIYOR. Sadece jeton kontrolü
-// yapılıp iş kaydı (job) DynamoDB'ye yazılıyor ve SQS kuyruğuna bir
-// mesaj bırakılıyor. Asıl Suno çağrısını processMusicGeneration.js
-// (kuyruktan tetiklenen ayrı bir Lambda) yapıyor — video projesindeki
-// startAssembly.js / AssemblyQueue deseninin birebir aynısı. Böylece:
-//  - Suno geçici hata verirse SQS otomatik olarak yeniden dener
-//  - 3 denemeden sonra hâlâ başarısızsa mesaj MusicGenerationDLQ'ya düşer
-//  - jeton, Suno isteği gerçekten kabul edildiğinde (worker içinde) düşülür
+// Suno/Lyria isteği KALICI olarak reddedilirse (worker'da markFailed),
+// bu rezervasyon otomatik olarak İADE edilir (bkz. jobLifecycle.js ->
+// markFailed -> refundCredits). Geçici hatalarda (SQS retry) rezervasyon
+// yerinde kalır -- iş sonunda ya başarılı olur ya da kalıcı başarısızlıkla
+// iade edilir, ASLA sessizce kaybolmaz.
 exports.handler = async (event) => {
-  try {
-    // 1) Kullanıcı kim?
-    const userId = event.requestContext.authorizer.claims.sub;
+  const userId = event.requestContext.authorizer.claims.sub;
+  let reservation = null;
 
-    // 1.5) HIZ SINIRI — jeton kontrolüne (DynamoDB okuma) bile gitmeden önce
-    // en ucuz ve en hızlı reddi burada yapıyoruz. /generate pahalı bir uç
-    // nokta (gerçek para harcıyor), bu yüzden limiti sıkı tutuyoruz: bir
-    // kullanıcı dakikada en fazla 5 üretim isteği başlatabilir.
+  try {
+    // 1) HIZ SINIRI — jeton kontrolüne (DynamoDB okuma/yazma) bile
+    // gitmeden önce en ucuz ve en hızlı reddi burada yapıyoruz.
     const rl = await checkRateLimit(userId, "generate", 5, 60);
     if (!rl.allowed) {
       return rateLimitResponse(rl.retryAfterSeconds);
     }
 
-    // 2) JETON KONTROLÜ — kuyruğa hiç yazmadan önce hızlıca reddet
-    const creditCheck = await checkCreditsAvailable(userId, SONG_CREDIT_COST);
-    if (!creditCheck.allowed) {
-      return {
-        statusCode: 429,
-        body: JSON.stringify({
-          error: "quota_exceeded",
-          message: `Bu ayki jeton hakkınız yetersiz (kalan: ${creditCheck.remaining}, gereken: ${SONG_CREDIT_COST}).`,
-        }),
-      };
+    // 2) KREDİ REZERVASYONU — atomik, TOCTOU'suz (madde 1).
+    try {
+      reservation = await reserveCredits(userId, SONG_CREDIT_COST);
+    } catch (err) {
+      if (err instanceof QuotaExceededError) {
+        return {
+          statusCode: 429,
+          body: JSON.stringify({
+            error: "quota_exceeded",
+            message: `Bu ayki jeton hakkınız yetersiz (kalan: ${err.remaining}, gereken: ${SONG_CREDIT_COST}).`,
+          }),
+        };
+      }
+      throw err;
     }
 
     const body = JSON.parse(event.body || "{}");
-    const callBackUrl = `https://${event.headers.Host}/${event.requestContext.stage}/suno-callback`;
+    const callBackUrl = `https://${event.headers.Host}/${event.requestContext.stage}/suno-callback?key=${encodeURIComponent(SUNO_CALLBACK_SECRET)}`;
     const jobId = crypto.randomUUID();
     const nowIso = new Date().toISOString();
 
-    // YENİ: hangi motor kullanılacak ('suno' | 'lyria'). Verilmezse ya da
-    // tanınmayan bir değerse eskisi gibi 'suno' varsayılır -- mevcut
-    // istemciler (henüz güncellenmemiş uygulama sürümleri) hiçbir
-    // değişiklik olmadan çalışmaya devam eder.
     const provider = body.provider === "lyria" ? "lyria" : "suno";
 
-    // 3) İş kaydı oluştur (henüz Suno'ya/Lyria'ya hiçbir şey gönderilmedi)
+    // 3) İş kaydı oluştur. creditReservation alanı, worker kalıcı bir
+    // hatada bu jobId için TAM OLARAK NE KADAR ve HANGİ DÖNEMDEN
+    // rezerve edildiğini bilip doğru şekilde iade edebilsin diye
+    // tutuluyor (bkz. jobLifecycle.js -> markFailed).
     await client.send(
       new PutCommand({
         TableName: JOBS_TABLE_NAME,
@@ -96,17 +81,18 @@ exports.handler = async (event) => {
           userId,
           provider,
           status: "queued", // queued -> submitting -> ready | failed
+          creditReservation: {
+            cost: SONG_CREDIT_COST,
+            period: reservation.period,
+          },
+          creditRefunded: false,
           payload: {
             lyrics: body.lyrics,
             style: body.style,
             title: body.title,
             instrumental: body.instrumental ?? false,
-            // YENİ: Lyria prompt'u oluştururken kullanılıyor (Suno dalı
-            // bu iki alanı zaten okumuyor, ekstra bulunmaları zararsız).
             vocalGender: body.vocalGender || null,
             durationSeconds: body.durationSeconds || null,
-            // YENİ: Lyria'nın sözleri doğru dilde yazması için (bkz.
-            // processMusicGeneration.js -> buildLyriaPrompt).
             lyricsLanguage: body.lyricsLanguage || null,
           },
           callBackUrl,
@@ -117,11 +103,11 @@ exports.handler = async (event) => {
       })
     );
 
-    // 4) Kuyruğa at — mesaj küçük tutuluyor (jobId yeter), worker detayı
-    // tablodan okuyor. Video projesiyle aynı yaklaşım.
+    // 4) Doğru kuyruğa at (madde 8 — Suno/Lyria ayrı kuyruklar).
+    const queueUrl = provider === "lyria" ? LYRIA_GENERATION_QUEUE_URL : GENERATION_QUEUE_URL;
     await sqs.send(
       new SendMessageCommand({
-        QueueUrl: GENERATION_QUEUE_URL,
+        QueueUrl: queueUrl,
         MessageBody: JSON.stringify({ jobId }),
       })
     );
@@ -131,11 +117,25 @@ exports.handler = async (event) => {
       body: JSON.stringify({
         jobId,
         status: "queued",
-        remainingCredits: creditCheck.remaining - SONG_CREDIT_COST,
+        remainingCredits: reservation.remaining,
       }),
     };
   } catch (err) {
     console.error(err);
+    // YENİ (madde 1 — telafi edici iade): kredi rezerve edildi ama
+    // bundan SONRAKİ bir adım (job kaydı/SQS) başarısız olduysa,
+    // kullanıcıyı asla "ücret alındı ama iş hiç kuyruğa girmedi"
+    // durumunda bırakmıyoruz -- aynı istek içinde, hemen telafi eden
+    // bir iade deniyoruz. (Bu, işin normal SONUCUNA bağlı asıl
+    // iade -- markFailed -- akışından FARKLI ve ONA EK bir güvenlik
+    // ağıdır; yalnızca job hiç kuyruğa giremediyse devreye girer.)
+    if (reservation) {
+      try {
+        await refundCreditsStandalone(userId, SONG_CREDIT_COST, reservation.period);
+      } catch (refundErr) {
+        console.error("Telafi edici iade de başarısız oldu:", refundErr);
+      }
+    }
     return {
       statusCode: 500,
       body: JSON.stringify({ error: "internal_error", message: err.message }),

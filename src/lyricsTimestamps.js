@@ -1,13 +1,16 @@
+const { sunoFetch } = require("./sunoProxy");
 const { checkRateLimit, rateLimitResponse } = require("./rateLimit");
-
-const SUNO_API_KEY = process.env.SUNO_API_KEY;
-const SUNO_BASE_URL = "https://api.sunoapi.org";
 
 // Karaoke gösterimi için kelime bazlı zaman damgalı sözleri Suno'dan
 // çeker. Kota harcamaz — zaten üretilmiş bir şarkının ek bir bilgisidir.
+//
+// DEĞİŞTİ (FINAL PRODUCTION HARDENING — madde 4): önceden bu dosya
+// sunoProxy.js'i ATLAYIP ham bir fetch() kullanıyordu -- yani ne merkezi
+// hesap-geneli rate limiter'dan ne de 429/5xx backoff'undan geçiyordu.
+// Artık TÜM Suno çağrıları (bu dosya dahil) tek bir noktadan (sunoFetch)
+// geçiyor.
 exports.handler = async (event) => {
   try {
-    // HIZ SINIRI — jeton harcamıyor ama yine de Suno'ya gerçek istek atıyor.
     const userId = event.requestContext.authorizer.claims.sub;
     const rl = await checkRateLimit(userId, "lyrics-timestamps", 15, 60);
     if (!rl.allowed) {
@@ -24,34 +27,22 @@ exports.handler = async (event) => {
       };
     }
 
-    const sunoResponse = await fetch(
-      `${SUNO_BASE_URL}/api/v1/generate/get-timestamped-lyrics`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${SUNO_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ taskId, audioId }),
-        signal: AbortSignal.timeout(20000),
-      }
-    );
+    const { ok, status, data } = await sunoFetch("/api/v1/generate/get-timestamped-lyrics", {
+      method: "POST",
+      body: JSON.stringify({ taskId, audioId }),
+    });
 
-    const sunoData = await sunoResponse.json();
-
-    if (!sunoResponse.ok || sunoData.code !== 200) {
+    if (!ok) {
       return {
-        statusCode: 502,
-        body: JSON.stringify({
-          error: sunoData.msg || "Zaman damgalı sözler alınamadı.",
-        }),
+        statusCode: status === 200 ? 502 : status,
+        body: JSON.stringify({ error: data.msg || "Zaman damgalı sözler alınamadı." }),
       };
     }
 
     return {
       statusCode: 200,
       body: JSON.stringify({
-        alignedWords: sunoData.data?.alignedWords || [],
+        alignedWords: data.data?.alignedWords || [],
       }),
     };
   } catch (err) {

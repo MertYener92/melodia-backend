@@ -9,7 +9,7 @@ Description: >
 Parameters:
   AppleBundleId:
     Type: String
-    Default: "com.melodia.app"
+    Default: "com.mertyener.melodia"
   SongCreditCost:
     Type: Number
     Default: 1
@@ -48,17 +48,68 @@ Parameters:
     Description: >
       App Store Connect > App Information > Apple ID (sayısal). SADECE
       Production ortamında zorunlu, Sandbox'ta boş bırakılabilir.
+  # ---------------------------------------------------------------
+  # YENİDEN EKLENDİ (cross-stack export/import koruması): Bu 5
+  # parametre + aşağıdaki CreditUsageTable/IdempotencyTable kaynakları
+  # ve ilgili Export'lar, ÖNCEKİ bir "final production hardening"
+  # turunda template.yaml'dan YANLIŞLIKLA çıkarılmıştı (GitHub'a hiç
+  # push edilmemiş bir versiyon baz alınmıştı). Canlıda deploy edilmiş
+  # gerçek Lambda kod paketleri (melodia-video: creditLedger.js,
+  # melodia-music-spec: credit_ledger.py/credit_plans.py) BU
+  # DEĞERLERE VE TABLOLARA AKTİF OLARAK BAĞIMLI olduğu, hem
+  # `aws cloudformation list-imports` hem doğrudan indirilen ZIP kod
+  # paketleri incelenerek KESİN olarak doğrulandı. Bu blok, o
+  # bağımlılıkları geri kurup korumak için eklendi -- backend'in KENDİ
+  # kodu bu değerleri kullanmıyor, sadece cross-stack sözleşmeyi
+  # (Export) sağlıyor.
+  MusicSpecCreditCost:
+    Type: Number
+    Default: 0
+    Description: >
+      Bir music-spec (AI muzik parametre) cikarimi kac jeton harcasin?
+      TEK GERCEK KAYNAK burasi -- melodia-music-spec kendi parametresini
+      TUTMUYOR, bu degeri ImportValue ile buradan okuyor.
+  PlanCreditsFree:
+    Type: Number
+    Default: 1
+    Description: >
+      Free (abonesiz) kullanicinin YASAM BOYU (bir kez, hic sifirlanmayan)
+      toplam jeton hakki.
+  PlanCreditsWeekly:
+    Type: Number
+    Default: 25
+    Description: pro_weekly plani -- HAFTALIK sifirlanan jeton hakki.
+  PlanCreditsMonthly:
+    Type: Number
+    Default: 120
+    Description: pro_monthly plani -- AYLIK sifirlanan jeton hakki.
+  PlanCreditsYearly:
+    Type: Number
+    Default: 120
+    Description: >
+      pro_yearly plani -- pro_monthly ile AYNI aylik jeton hakki (yillik
+      odeme sadece faturalama sikligini degistiriyor).
 
 Globals:
   Function:
     Timeout: 60
     MemorySize: 256
-    Runtime: nodejs20.x
+    Runtime: nodejs24.x
     Environment:
       Variables:
         TABLE_NAME: !Ref UsersTable
         SUNO_API_KEY: '{{resolve:secretsmanager:melodia/suno-api-key}}'
         GEMINI_API_KEY: '{{resolve:secretsmanager:melodia/gemini-api-key}}'
+        # YENİ (FINAL PRODUCTION HARDENING — madde 6, webhook authentication):
+        # sunoapi.org HMAC/imza tabanlı bir webhook doğrulama SUNMUYOR --
+        # bu paylaşılan secret'ı BİZ üretip callBackUrl'e (generate.js)
+        # gömüyoruz, sunoCallback.js de aynı değeri doğruluyor. SUNO_API_KEY
+        # ile AYNI desen: deploy anında Secrets Manager'dan çözülür, koda
+        # asla açık yazılmaz. DEPLOY ÖNCESİ bu secret'ı oluşturman gerekir:
+        #   aws secretsmanager create-secret --name melodia/suno-callback-secret \
+        #     --secret-string "$(openssl rand -hex 32)"
+        # (openssl rand -hex 32 -> 256 bit/64 hex karakter rastgele değer)
+        SUNO_CALLBACK_SECRET: '{{resolve:secretsmanager:melodia/suno-callback-secret}}'
         SONGS_TABLE_NAME: !Ref SongsTable
         AUDIO_BUCKET_NAME: !Ref AudioBucket
         CLOUDFRONT_DOMAIN: !GetAtt AudioDistribution.DomainName
@@ -76,6 +127,27 @@ Resources:
           AttributeType: S
       KeySchema:
         - AttributeName: userId
+          KeyType: HASH
+
+  # YENİ (jeton istismarı düzeltmesi): "hesabı sil, aynı Apple kimliğiyle
+  # tekrar kaydol, yeniden ücretsiz jeton kazan" döngüsünü kapatmak için.
+  # appleAuth.js, Apple'ın bu uygulama+Apple ID kombinasyonu için verdiği
+  # SABİT kimliği (hesap silinse bile DEĞİŞMEYEN) hash'leyip buraya
+  # KALICI olarak yazıyor -- deleteAccount.js bu tabloyu BİLEREK
+  # SİLMİYOR/silmemeli (bkz. deleteAccount.js'teki not). Tabloda isim,
+  # e-posta ya da başka bir kişisel veri YOK -- sadece opak bir hash +
+  # zaman damgası, TEK amacı bu kötüye kullanımı önlemek. TTL YOK --
+  # kalıcı olması gerekiyor.
+  FreeTrialLedgerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: melodia-free-trial-ledger
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: appleUserIdHash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: appleUserIdHash
           KeyType: HASH
 
   # Suno'nun her sarki uretiminde GERCEKTE kac kredi harcadigini olcmek
@@ -100,8 +172,9 @@ Resources:
 
   # YENİ: Şarkı üretim işlerinin (job) durumunu tutan tablo. generate.js
   # Suno'ya artık DOĞRUDAN istek atmıyor — burada "queued" bir kayıt
-  # oluşturup MusicGenerationQueue'ya yazıyor. processMusicGeneration.js
-  # (worker) bu kaydı okuyup Suno'yu çağırıyor ve sonucu (ready/failed +
+  # oluşturup ilgili kuyruğa (Suno ya da Lyria) yazıyor.
+  # processSunoGeneration.js / processLyriaGeneration.js (worker'lar) bu
+  # kaydı okuyup Suno/Lyria'yı çağırıyor ve sonucu (ready/failed +
   # taskId) buraya yazıyor. Flutter istemcisi /status?jobId=... ile bu
   # tabloyu pollar. TTL ile 24 saat sonra otomatik silinir.
   GenerationJobsTable:
@@ -112,23 +185,81 @@ Resources:
       AttributeDefinitions:
         - AttributeName: jobId
           AttributeType: S
+        # YENİ (5.000 kullanıcı ölçeklendirmesi — webhook + 18sn cache):
+        # sunoCallback.js, Suno'nun webhook'unda SADECE taskId'yi bilir
+        # (jobId'yi DEĞİL) -- bu GSI olmadan doğru job kaydını bulmak
+        # için tüm tabloyu taramak (Scan) gerekirdi, bu da 5.000
+        # kullanıcı ölçeğinde hem yavaş hem pahalı olurdu.
+        - AttributeName: taskId
+          AttributeType: S
       KeySchema:
         - AttributeName: jobId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: TaskIdIndex
+          KeySchema:
+            - AttributeName: taskId
+              KeyType: HASH
+          # KEYS_ONLY yeterli: sunoCallback.js bu sorgudan SADECE jobId'yi
+          # okuyor (bkz. sunoStatusCache.js -> findJobByTaskId), tüm job
+          # kaydını GSI'a kopyalamanın (ProjectionType ALL) ek depolama/
+          # yazma maliyeti gereksiz.
+          Projection:
+            ProjectionType: KEYS_ONLY
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  # YENİDEN EKLENDİ: melodia-video (createVideoProject.js/generateStoryboard.js
+  # -> creditLedger.js) ve melodia-music-spec (app.py -> credit_ledger.py)
+  # tarafından cross-stack ImportValue ile kullanılan PAYLAŞILAN jeton
+  # kullanım sayacı. Bu tablo (userId+period) bazında "bu dönem ne kadar
+  # jeton kullanıldı" tutuyor -- backend/video/music-spec'in HEPSİ aynı
+  # (user, dönem) satırına atomik ADD ile yazabiliyor. Bkz. Parameters
+  # bölümündeki not -- bu tablo daha önce yanlışlıkla kaldırılmıştı.
+  CreditUsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: melodia-credit-usage
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: period
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: period
+          KeyType: RANGE
+
+  # YENİDEN EKLENDİ: melodia-music-spec'in credit_ledger.py'sindeki
+  # charge_credits() fonksiyonu, aynı (userId, action, requestId) ile
+  # gelen tekrar çağrıların jetonu iki kez düşürmesini bu tablo
+  # üzerindeki koşullu put_item ile engelliyor. Bkz. Parameters
+  # bölümündeki not.
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: melodia-idempotency
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: idempotencyKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: idempotencyKey
           KeyType: HASH
       TimeToLiveSpecification:
         AttributeName: expiresAt
         Enabled: true
 
   # ---------------------------------------------------------------
-  # YENİ: Müzik üretim kuyruğu (SQS). generate.js artık Suno'yu
-  # SENKRON çağırmıyor, sadece bu kuyruğa yazıyor. Böylece:
-  #  - processMusicGeneration bir istisna fırlatırsa (Suno 5xx/429/
-  #    timeout gibi geçici hatalar) SQS otomatik olarak yeniden dener
-  #    (visibility timeout dolunca)
-  #  - maxReceiveCount (3) denemeden sonra hâlâ başarısızsa mesaj
-  #    kendiliğinden MusicGenerationDLQ'ya (dead-letter queue) düşer
-  #  - melodia-video'daki AssemblyQueue/AssemblyDLQ ile BİREBİR AYNI
-  #    desen kullanılıyor
+  # DEĞİŞTİ (FINAL PRODUCTION HARDENING — madde 8): Suno ve Lyria artık
+  # AYRI kuyruk + AYRI worker (processSunoGeneration.js /
+  # processLyriaGeneration.js). Önceden ikisi AYNI kuyruğu/fonksiyonu
+  # paylaşıyordu; Lyria job'ları senkron olarak Lambda'yı ~150sn açık
+  # tuttuğu için, yoğun Lyria kullanımı Suno'nun hızlı submission
+  # akışının concurrency slotlarını tüketebiliyordu. Artık bu imkansız.
   # ---------------------------------------------------------------
   MusicGenerationDLQ:
     Type: AWS::SQS::Queue
@@ -140,10 +271,38 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: melodia-music-generation-queue
-      VisibilityTimeout: 180 # DÜZELTME: ProcessMusicGenerationFunction'ın yeni Timeout'undan (150s) biraz fazla -- Lyria isteği hâlâ işlenirken SQS'in mesajı erken yeniden teslim edip ÇİFT ücretlendirmesini önler.
+      VisibilityTimeout: 60 # DEĞİŞTİ: Suno submission'ı artık hızlı (Lyria'nın 150sn'lik bekleme süresini TAŞIMIYOR, o LyriaGenerationQueue'da) -- ProcessSunoGenerationFunction'ın yeni Timeout'undan (30sn) biraz fazla.
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt MusicGenerationDLQ.Arn
         maxReceiveCount: 3
+
+  LyriaGenerationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: melodia-lyria-generation-dlq
+      MessageRetentionPeriod: 1209600 # 14 gün
+
+  LyriaGenerationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: melodia-lyria-generation-queue
+      VisibilityTimeout: 180 # Lyria tam şarkı üretimini SENKRON bekliyor (ProcessLyriaGenerationFunction Timeout: 150sn) + pay.
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt LyriaGenerationDLQ.Arn
+        maxReceiveCount: 3
+
+  # YENİ (madde 10 — observability): tüm kritik alarmların (DLQ derinliği,
+  # Lambda hataları, stale-claim, provider rate-limit tükenmesi) gittiği
+  # tek SNS topic'i. Deploy sonrası AWS Konsolu'ndan (SNS > Topics >
+  # MelodiaAlarms > Create subscription) bir e-posta/Slack webhook
+  # abone etmen gerekir -- bu, senin karar vereceğin bir bilgi (e-posta
+  # adresi) olduğu için template'e gömülmedi.
+  MelodiaAlarmsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: melodia-alarms
+      DisplayName: Melodia Production Alarms
+
 
   # YENİ: Kullanıcı bazlı hız sınırlama (rate limiting) için sayaç tablosu.
   # rateLimit.js bu tabloyu "sabit pencereli" bir sayaç olarak kullanıyor —
@@ -272,9 +431,10 @@ Resources:
         - ALLOW_REFRESH_TOKEN_AUTH
         - ALLOW_ADMIN_USER_PASSWORD_AUTH
 
-  # DEĞİŞTİ: Artık Suno'yu doğrudan çağırmıyor — sadece jeton kontrolü
-  # yapıp bir job kaydı oluşturuyor ve MusicGenerationQueue'ya yazıyor.
-  # Bu yüzden Timeout kısaltıldı (ağır iş artık burada değil).
+  # DEĞİŞTİ: Artık Suno'yu doğrudan çağırmıyor — sadece kredi rezervasyonu
+  # yapıp bir job kaydı oluşturuyor ve provider'a göre doğru kuyruğa
+  # (Suno ya da Lyria) yazıyor. Bu yüzden Timeout kısaltıldı (ağır iş
+  # artık burada değil).
   GenerateSongFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -286,7 +446,11 @@ Resources:
           SONG_CREDIT_COST: !Ref SongCreditCost
           JOBS_TABLE_NAME: !Ref GenerationJobsTable
           GENERATION_QUEUE_URL: !Ref MusicGenerationQueue
+          # YENİ (madde 8): provider'a göre doğru kuyruğa yönlendirme.
+          LYRIA_GENERATION_QUEUE_URL: !Ref LyriaGenerationQueue
           RATE_LIMIT_TABLE_NAME: !Ref RateLimitTable
+          # YENİ (jeton istismarı düzeltmesi): bkz. creditReservation.js
+          FREE_TRIAL_LEDGER_TABLE_NAME: !Ref FreeTrialLedgerTable
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
@@ -294,8 +458,19 @@ Resources:
             TableName: !Ref GenerationJobsTable
         - DynamoDBCrudPolicy:
             TableName: !Ref RateLimitTable
+        # YENİ (jeton istismarı düzeltmesi): claimFreeTrialOrThrow SADECE
+        # PutItem yapıyor (DynamoDBCrudPolicy yerine dar/minimal bir izin
+        # yeterli -- bu fonksiyonun bu tablodan HİÇBİR ŞEYİ okumasına/
+        # silmesine gerek yok).
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt FreeTrialLedgerTable.Arn
         - SQSSendMessagePolicy:
             QueueName: !GetAtt MusicGenerationQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt LyriaGenerationQueue.QueueName
       Events:
         Api:
           Type: Api
@@ -304,25 +479,75 @@ Resources:
             Path: /generate
             Method: post
 
-  # YENİ: MusicGenerationQueue'dan tetiklenen worker. Asıl Suno /generate
-  # çağrısını burada yapıyoruz. Suno geçici hata verirse (5xx/429/timeout)
-  # istisna fırlatılır ve SQS otomatik yeniden dener; kalıcı hatalarda
-  # (ör. içerik reddi) job doğrudan "failed" işaretlenir, tekrar denenmez.
-  # Jeton SADECE Suno isteği kabul edildiğinde burada düşülüyor.
-  ProcessMusicGenerationFunction:
+  # DEĞİŞTİ (FINAL PRODUCTION HARDENING — madde 8): eski
+  # ProcessMusicGenerationFunction ikiye ayrıldı. Bu, SADECE Suno
+  # submission'larını işler (processSunoGeneration.js) -- MusicGenerationQueue'dan
+  # tetiklenir. Suno geçici hata verirse (5xx/429/timeout) istisna
+  # fırlatılır ve SQS otomatik yeniden dener; kalıcı hatalarda job
+  # "failed" işaretlenir ve rezerve edilen kredi İADE EDİLİR (bkz.
+  # jobLifecycle.js -> markFailed -> creditReservation.refundCredits).
+  #
+  # DEĞİŞTİ (madde 1): kredi ARTIK BURADA DÜŞÜLMÜYOR -- generate.js'de
+  # job kuyruğa yazılmadan ÖNCE atomik olarak rezerve edildi.
+  ProcessSunoGenerationFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
-      Handler: processMusicGeneration.handler
-      # DÜZELTME (Lyria entegrasyonu): 60sn'den 150sn'ye çıkarıldı --
-      # Lyria 3.5 tam şarkı üretimi Suno'dan daha uzun sürebiliyor
-      # (lyriaProxy.js'teki HTTP timeout 120sn), + S3 yükleme + DB
-      # yazmaları için pay bırakıldı. Suno dalı zaten çok daha hızlı
-      # kabul ediyor, bu üst sınır ona zarar vermez.
+      Handler: processSunoGeneration.handler
+      # DEĞİŞTİ: Suno submission'ı artık hızlı (webhook ile sonuçlanıyor,
+      # burada sonucu BEKLEMİYORUZ) -- 150sn'den 30sn'ye indirildi.
+      Timeout: 30
+      Environment:
+        Variables:
+          JOBS_TABLE_NAME: !Ref GenerationJobsTable
+          RATE_LIMIT_TABLE_NAME: !Ref RateLimitTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GenerationJobsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RateLimitTable
+        # YENİ (madde 1 — atomik kredi iadesi): jobLifecycle.markFailed,
+        # kredi iadesini VE job üzerindeki "refunded" bayrağını TEK
+        # DynamoDB Transaction'ında (TransactWriteItems) yazıyor.
+        # DynamoDBCrudPolicy bu işlemi İÇERMEZ, ayrıca ekleniyor.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt UsersTable.Arn
+                - !GetAtt GenerationJobsTable.Arn
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+      Events:
+        GenerationQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MusicGenerationQueue.Arn
+            BatchSize: 1
+            # YENİ (madde 4/8 — Lambda concurrency ≠ Suno concurrency):
+            # Suno'nun GERÇEK hız sınırı sunoProxy.js'teki DynamoDB
+            # tabanlı sayaçla KESİN olarak korunuyor -- buradaki 10,
+            # sadece kuyruk aniden binlerce mesajla dolduğunda binlerce
+            # Lambda'nın anlık olarak ayağa kalkmasını önleyen kaba bir
+            # üst sınır. Artık Lyria ile PAYLAŞILMIYOR.
+            ScalingConfig:
+              MaximumConcurrency: 10
+
+  # YENİ (madde 8): Lyria'ya ÖZGÜ worker -- LyriaGenerationQueue'dan
+  # tetiklenir, senkron olarak tam şarkı üretimini bekler (Timeout: 150sn).
+  # Suno worker'ından TAMAMEN bağımsız concurrency'e sahip -- biri
+  # diğerinin slotlarını tüketemez.
+  ProcessLyriaGenerationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: processLyriaGeneration.handler
       Timeout: 150
       Environment:
         Variables:
-          SONG_CREDIT_COST: !Ref SongCreditCost
           JOBS_TABLE_NAME: !Ref GenerationJobsTable
           AUDIO_BUCKET_NAME: !Ref AudioBucket
       Policies:
@@ -332,16 +557,28 @@ Resources:
             TableName: !Ref GenerationJobsTable
         - S3CrudPolicy:
             BucketName: !Ref AudioBucket
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt UsersTable.Arn
+                - !GetAtt GenerationJobsTable.Arn
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/gemini-api-key-*'
       Events:
-        GenerationQueueEvent:
+        LyriaGenerationQueueEvent:
           Type: SQS
           Properties:
-            Queue: !GetAtt MusicGenerationQueue.Arn
+            Queue: !GetAtt LyriaGenerationQueue.Arn
             BatchSize: 1
+            # Lyria job'ları uzun sürdüğü (150sn'e kadar) için daha
+            # yüksek bir üst sınır -- Gemini'nin kendi hız sınırı resmi
+            # API olduğu için Suno'dan daha yüksek/farklı, bu worker
+            # sunoProxy.js'in limiter'ını hiç kullanmıyor (lyriaProxy.js
+            # ayrı, kendi HTTP timeout'una sahip).
+            ScalingConfig:
+              MaximumConcurrency: 20
 
   LyricsFunction:
     Type: AWS::Serverless::Function
@@ -393,6 +630,21 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: status.handler
+      # DÜZELTME (deploy hatası): ReservedConcurrentExecutions: 200
+      # ayarı KALDIRILDI -- bu hesabın GERÇEK toplam Lambda concurrency
+      # kotası sadece 10 (AWS'nin yeni-hesap varsayılanı, henüz
+      # artırılmamış), 1000 DEĞİL. "200 ayır" isteği, deploy'u
+      # "ReservedConcurrentExecutions ... decreases account's
+      # UnreservedConcurrentExecutions below its minimum value of [10]"
+      # hatasıyla başarısız kılıp otomatik rollback'e düşürdü. 10'luk
+      # bir kotada StatusFunction'a herhangi bir pay ayırmak (5 bile)
+      # geri kalan ~17 fonksiyonun paylaşacağı alanı tehlikeli şekilde
+      # daraltır. GERÇEK 5.000 kullanıcı hedefine yaklaşmadan önce,
+      # AWS Support üzerinden bu hesabın "Concurrent executions"
+      # kotasının (Service Quotas kod: L-B99A9384) artırılması
+      # ŞART -- bu bir kod/config değişikliği değil, hesap kotası
+      # talebidir. Kota artınca bu satır (uygun bir değerle, örn. yeni
+      # kotanın ~%20'si) geri eklenebilir.
       Environment:
         Variables:
           JOBS_TABLE_NAME: !Ref GenerationJobsTable
@@ -400,7 +652,13 @@ Resources:
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
-        - DynamoDBReadPolicy:
+        # DEĞİŞTİ: DynamoDBReadPolicy -> DynamoDBCrudPolicy. status.js
+        # artık sadece OKUMUYOR -- 18sn'lik cache bayatladığında yaptığı
+        # güvenlik-ağı poll'unun sonucunu da job kaydına YAZIYOR (bkz.
+        # fallbackLivePoll -> writeSunoStatusCache), böylece aynı job'ı
+        # o an pollayan başka istekler de bu tek canlı çağrıdan
+        # faydalanabiliyor.
+        - DynamoDBCrudPolicy:
             TableName: !Ref GenerationJobsTable
         - DynamoDBCrudPolicy:
             TableName: !Ref RateLimitTable
@@ -412,14 +670,34 @@ Resources:
             Path: /status
             Method: get
 
+  # DEĞİŞTİ (5.000 kullanıcı ölçeklendirmesi): artık sadece loglamıyor --
+  # Suno'nun webhook sonucunu GenerationJobsTable'a yazıyor (bkz.
+  # sunoCallback.js, sunoStatusCache.js). Bu yüzden tabloya okuma+yazma
+  # (TaskIdIndex GSI'ı üzerinden sorgu + UpdateItem) izni ve tablo adı
+  # gerekiyor.
   SunoCallbackFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
       Handler: sunoCallback.handler
+      Environment:
+        Variables:
+          JOBS_TABLE_NAME: !Ref GenerationJobsTable
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GenerationJobsTable
+        # YENİ (madde 1/6 — webhook'un async "error" dalındaki kredi
+        # iadesi): refundCredits, iade VE job'ın "refunded" bayrağını
+        # TEK DynamoDB Transaction'ında yazıyor.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt UsersTable.Arn
+                - !GetAtt GenerationJobsTable.Arn
       Events:
         Api:
           Type: Api
@@ -449,6 +727,13 @@ Resources:
                 - cognito-idp:AdminInitiateAuth
                 - cognito-idp:AdminGetUser
               Resource: !GetAtt UserPool.Arn
+        # YENİ (jeton istismarı düzeltmesi): appleUserIdHash'i UsersTable'a
+        # yazabilmek için -- SADECE UpdateItem, dar/minimal izin.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+              Resource: !GetAtt UsersTable.Arn
       Events:
         Api:
           Type: Api
@@ -709,11 +994,19 @@ Resources:
             Auth:
               Authorizer: NONE
 
-  # YENİ: API Gateway'in kendi, kaba/genel taşkın koruması. Kullanıcı bazlı
-  # DEĞİL — tüm API için toplam saniyelik istek tavanı. rateLimit.js'teki
-  # kullanıcı bazlı limitler "tek bir kullanıcı sistemi kötüye kullanamasın"
-  # içinken, bu ayar "API'nin tamamı aniden binlerce istekle boğulmasın"
-  # (ör. bir DDoS denemesi) için ilk savunma hattı. İkisi birlikte çalışıyor.
+  # DEĞİŞTİ (FINAL PRODUCTION HARDENING — madde 7): 5.000 kayıtlı
+  # kullanıcı hedefi için 300/600'den 1500/3000'e çıkarıldı. Hesap:
+  # 500-1.000 eşzamanlı aktif kullanıcı × 5sn'lik /status polling ≈
+  # 100-200 istek/sn; buna diğer uç noktalar (/quota, /songs, /generate)
+  # ve patlama payı eklenince 1500 sürdürülebilir / 3000 burst,
+  # gerçekçi bir tepe yükün ÇOK üzerinde rahat bir pay bırakıyor.
+  # AWS'nin bölge başına hesap-varsayılan API Gateway tavanı 10.000 RPS
+  # sürdürülebilir / 5.000 burst (Service Quotas üzerinden artırılabilir)
+  # -- yani bu değer, paylaşılan hesapta başka büyük yük yoksa, bir
+  # AWS Support talebi GEREKTİRMEDEN mevcut varsayılan tavanın içinde
+  # kalır. Trafik gerçek ölçümlerle netleşince (CloudWatch'taki
+  # ApiGateway Count/Latency metrikleri) bu değer yine tek satırlık bir
+  # değişiklikle ayarlanabilir.
   MelodiaApi:
     Type: AWS::Serverless::Api
     Properties:
@@ -721,8 +1014,8 @@ Resources:
       MethodSettings:
         - ResourcePath: "/*"
           HttpMethod: "*"
-          ThrottlingRateLimit: 20 # saniyede sürekli izin verilen ortalama istek sayısı (tüm API, tüm kullanıcılar toplamı)
-          ThrottlingBurstLimit: 40 # anlık patlamalarda (ör. birkaç kullanıcı aynı anda) tolerans
+          ThrottlingRateLimit: 1500 # saniyede sürekli izin verilen ortalama istek sayısı (tüm API, tüm kullanıcılar toplamı)
+          ThrottlingBurstLimit: 3000 # anlık patlamalarda (ör. binlerce kullanıcının aynı anda pollamaya başlaması) tolerans
       Cors:
         AllowMethods: "'GET,POST,DELETE,OPTIONS'"
         AllowHeaders: "'Content-Type,Authorization'"
@@ -732,6 +1025,262 @@ Resources:
         Authorizers:
           CognitoAuth:
             UserPoolArn: !GetAtt UserPool.Arn
+
+  # ---------------------------------------------------------------
+  # YENİ (FINAL PRODUCTION HARDENING — madde 10, observability):
+  # DLQ derinliği, Lambda hataları, stale-claim ve provider rate-limit
+  # tükenmesi için CloudWatch Alarm'ları -- hepsi MelodiaAlarmsTopic'e
+  # (SNS) bildiriyor. Log Group'ları EXPLICIT olarak tanımlıyoruz (ilk
+  # deploy'da Lambda henüz hiç çalışmadığı için otomatik oluşan log
+  # group henüz yok -- MetricFilter var olmayan bir log group'a
+  # bağlanamaz) + 30 günlük retention (varsayılan "hiç silinmez"
+  # yerine, gereksiz log maliyeti birikmesin diye).
+  # ---------------------------------------------------------------
+  ProcessSunoGenerationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProcessSunoGenerationFunction}"
+      RetentionInDays: 30
+
+  ProcessLyriaGenerationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProcessLyriaGenerationFunction}"
+      RetentionInDays: 30
+
+  # madde 9 — stale-claim reclaim metriği (her iki worker'da da olabilir)
+  ProcessSunoStaleClaimMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ProcessSunoGenerationLogGroup
+      FilterPattern: "STALE_CLAIM_RECLAIMED"
+      MetricTransformations:
+        - MetricName: StaleClaimReclaimed
+          MetricNamespace: Melodia
+          MetricValue: "1"
+          DefaultValue: 0
+
+  ProcessLyriaStaleClaimMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ProcessLyriaGenerationLogGroup
+      FilterPattern: "STALE_CLAIM_RECLAIMED"
+      MetricTransformations:
+        - MetricName: StaleClaimReclaimed
+          MetricNamespace: Melodia
+          MetricValue: "1"
+          DefaultValue: 0
+
+  StaleClaimReclaimedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: melodia-stale-claim-reclaimed
+      AlarmDescription: >
+        Bir job stale-claim ile yeniden ele alındı -- olası duplicate
+        Suno/Lyria submission riski (madde 9). Suno/Lyria idempotency-key
+        SUNMADIĞI için bu risk kod tarafında tam kapatılamıyor; sık
+        tekrarlanıyorsa Suno/Gemini maliyet panelinden çapraz kontrol et.
+      Namespace: Melodia
+      MetricName: StaleClaimReclaimed
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref MelodiaAlarmsTopic
+
+  # madde 5 — merkezi rate limiter'ın kendi bekleme bütçesini tükettiği
+  # (Suno'ya hiç gidemediği) durumlar. Sık tekrarlanıyorsa
+  # PROVIDER_WINDOW_LIMIT'in çok düşük olduğu ya da gerçek trafiğin
+  # beklenenden çok yüksek olduğu anlamına gelir.
+  ProviderRateLimitMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ProcessSunoGenerationLogGroup
+      FilterPattern: "PROVIDER_RATE_LIMIT_EXHAUSTED"
+      MetricTransformations:
+        - MetricName: ProviderRateLimitExhausted
+          MetricNamespace: Melodia
+          MetricValue: "1"
+          DefaultValue: 0
+
+  StatusProviderRateLimitMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${StatusFunction}"
+      FilterPattern: "PROVIDER_RATE_LIMIT_EXHAUSTED"
+      MetricTransformations:
+        - MetricName: ProviderRateLimitExhausted
+          MetricNamespace: Melodia
+          MetricValue: "1"
+          DefaultValue: 0
+
+  ProviderRateLimitAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: melodia-provider-rate-limit-exhausted
+      AlarmDescription: >
+        Merkezi Suno rate limiter tekrar tekrar tükeniyor -- gerçek
+        trafik PROVIDER_WINDOW_LIMIT'i (sunoProxy.js) aşıyor olabilir,
+        ya da Suno hesabının kendi limitini yükseltmek gerekebilir.
+      Namespace: Melodia
+      MetricName: ProviderRateLimitExhausted
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref MelodiaAlarmsTopic
+
+  # madde 10 — DLQ derinliği. 0'dan büyük olması, 3 denemeden sonra
+  # KALICI olarak başarısız kalmış (ve otomatik kurtarılamayan) işler
+  # olduğu anlamına gelir -- manuel inceleme gerekir.
+  MusicGenerationDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: melodia-suno-dlq-not-empty
+      AlarmDescription: "MusicGenerationDLQ'da mesaj var -- 3 denemeden sonra kalıcı olarak başarısız Suno job'ları."
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt MusicGenerationDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref MelodiaAlarmsTopic
+
+  LyriaGenerationDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: melodia-lyria-dlq-not-empty
+      AlarmDescription: "LyriaGenerationDLQ'da mesaj var -- 3 denemeden sonra kalıcı olarak başarısız Lyria job'ları."
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt LyriaGenerationDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref MelodiaAlarmsTopic
+
+  # madde 10 — Lambda hata oranı (worker'lar + status + generate).
+  ProcessSunoGenerationErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: melodia-process-suno-errors
+      AlarmDescription: "ProcessSunoGenerationFunction'da hata oranı yüksek."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessSunoGenerationFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref MelodiaAlarmsTopic
+
+  ProcessLyriaGenerationErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: melodia-process-lyria-errors
+      AlarmDescription: "ProcessLyriaGenerationFunction'da hata oranı yüksek."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessLyriaGenerationFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref MelodiaAlarmsTopic
+
+  StatusFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: melodia-status-errors
+      AlarmDescription: "StatusFunction'da (/status polling) hata oranı yüksek."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref StatusFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 20
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref MelodiaAlarmsTopic
+
+  GenerateSongFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: melodia-generate-errors
+      AlarmDescription: "GenerateSongFunction'da (kredi rezervasyonu + job oluşturma) hata oranı yüksek."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GenerateSongFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref MelodiaAlarmsTopic
+
+  # madde 7 — DÜZELTME: ReservedConcurrentExecutions kaldırıldığı için
+  # (hesabın toplam kotası sadece 10, bkz. StatusFunction'daki not) bu
+  # alarm artık kendi payı değil, hesabın PAYLAŞILAN concurrency
+  # havuzunun genel throttle'ını izliyor -- yine de erken uyarı için
+  # değerli, dokunulmadı.
+  StatusFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: melodia-status-throttles
+      AlarmDescription: >
+        StatusFunction throttle yiyor -- hesabın PAYLAŞILAN Lambda
+        concurrency kotası (şu an sadece 10, Service Quotas kod:
+        L-B99A9384) yetersiz kalıyor olabilir. AWS Support üzerinden
+        kota artışı gerekebilir.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref StatusFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref MelodiaAlarmsTopic
 
 Outputs:
   ApiUrl:
@@ -755,11 +1304,68 @@ Outputs:
     Value: !GetAtt UsersTable.Arn
     Export:
       Name: melodia-users-table-arn
+  # YENİDEN EKLENDİ (bkz. Parameters bölümündeki not) -- bu 9 export,
+  # melodia-video ve melodia-music-spec'in canlıda AKTİF olarak
+  # ImportValue ile kullandığı, doğrulanmış cross-stack sözleşmenin
+  # parçası. Kaldırılmaları/değiştirilmeleri o iki stack'in bir
+  # sonraki deploy'unu VEYA runtime'ını kırar.
+  CreditUsageTableName:
+    Description: >
+      melodia-video ve melodia-music-spec'in AYNI atomik jeton kullanim
+      sayacini paylasmasi icin disari acilan tablo adi.
+    Value: !Ref CreditUsageTable
+    Export:
+      Name: melodia-credit-usage-table-name
+  CreditUsageTableArn:
+    Value: !GetAtt CreditUsageTable.Arn
+    Export:
+      Name: melodia-credit-usage-table-arn
+  IdempotencyTableName:
+    Value: !Ref IdempotencyTable
+    Export:
+      Name: melodia-idempotency-table-name
+  IdempotencyTableArn:
+    Value: !GetAtt IdempotencyTable.Arn
+    Export:
+      Name: melodia-idempotency-table-arn
+  MusicSpecCreditCostExport:
+    Value: !Ref MusicSpecCreditCost
+    Export:
+      Name: melodia-music-spec-credit-cost
+  PlanCreditsFreeExport:
+    Value: !Ref PlanCreditsFree
+    Export:
+      Name: melodia-plan-credits-free
+  PlanCreditsWeeklyExport:
+    Value: !Ref PlanCreditsWeekly
+    Export:
+      Name: melodia-plan-credits-weekly
+  PlanCreditsMonthlyExport:
+    Value: !Ref PlanCreditsMonthly
+    Export:
+      Name: melodia-plan-credits-monthly
+  PlanCreditsYearlyExport:
+    Value: !Ref PlanCreditsYearly
+    Export:
+      Name: melodia-plan-credits-yearly
   MusicGenerationDLQUrl:
     Description: >
-      Kalici olarak basarisiz olan (3 denemeden sonra) muzik uretim
+      Kalici olarak basarisiz olan (3 denemeden sonra) Suno muzik uretim
       isleri buraya duser. Boyutu 0'dan buyukse manuel inceleme gerekir.
     Value: !Ref MusicGenerationDLQ
+  LyriaGenerationDLQUrl:
+    Description: >
+      Kalici olarak basarisiz olan (3 denemeden sonra) Lyria muzik
+      uretim isleri buraya duser. Boyutu 0'dan buyukse manuel inceleme
+      gerekir.
+    Value: !Ref LyriaGenerationDLQ
+  MelodiaAlarmsTopicArn:
+    Description: >
+      Deploy sonrasi SNS konsolundan (Topics > melodia-alarms >
+      Create subscription) bir e-posta/Slack webhook abone et --
+      butun kritik alarmlar (DLQ, Lambda hatalari, stale-claim,
+      provider rate-limit tukenmesi) buraya bildiriyor.
+    Value: !Ref MelodiaAlarmsTopic
   AppleNotificationsUrl:
     Description: >
       App Store Connect > App Information > App Store Server Notifications

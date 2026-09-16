@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const jwksClient = require("jwks-rsa");
 const {
@@ -7,11 +8,19 @@ const {
   AdminInitiateAuthCommand,
   AdminGetUserCommand,
 } = require("@aws-sdk/client-cognito-identity-provider");
+const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+const { DynamoDBDocumentClient, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
 
 const cognito = new CognitoIdentityProviderClient({});
+const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const USER_POOL_ID = process.env.USER_POOL_ID;
 const USER_POOL_CLIENT_ID = process.env.USER_POOL_CLIENT_ID;
 const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID;
+// YENİ (jeton istismarı düzeltmesi -- "hesabı sil, aynı Apple kimliğiyle
+// tekrar kaydol, yeniden ücretsiz jeton kazan" döngüsünü kapatmak için).
+// TABLE_NAME zaten Globals'tan geliyor (bkz. template.yaml), yeni bir
+// env var gerekmedi.
+const USERS_TABLE_NAME = process.env.TABLE_NAME;
 
 const client = jwksClient({ jwksUri: "https://appleid.apple.com/auth/keys" });
 
@@ -105,6 +114,45 @@ exports.handler = async (event) => {
         AuthParameters: { USERNAME: username, PASSWORD: randomPassword },
       })
     );
+
+    // YENİ (jeton istismarı düzeltmesi): Apple'ın bu uygulama+Apple ID
+    // kombinasyonu için verdiği SABİT kimliği (appleUserId -- hesap
+    // silinip yeniden oluşturulsa bile ASLA DEĞİŞMEZ, Cognito'nun kendi
+    // rastgele ürettiği 'sub'ın aksine) hash'leyip bu girişle ilişkili
+    // UsersTable satırına yazıyoruz. Bu hash, deleteAccount.js'nin
+    // SİLMEDİĞİ ayrı bir tabloda (melodia-free-trial-ledger, bkz.
+    // creditReservation.js) "bu kimlik ücretsiz denemesini kullandı mı"
+    // takibi için kullanılacak. SADECE opak bir hash yazılıyor -- isim,
+    // e-posta ya da başka bir kişisel veri YOK. Cognito'nun az önce
+    // KENDİSİNİN ürettiği IdToken'ı çözüyoruz (tekrar doğrulamaya gerek
+    // yok, zaten güvenilir kaynak) -- buradan hedef UsersTable
+    // satırının userId'sini (Cognito 'sub') alıyoruz.
+    try {
+      const appleUserIdHash = crypto.createHash("sha256").update(appleUserId).digest("hex");
+      const idTokenPayload = jwt.decode(authResult.AuthenticationResult.IdToken);
+      const cognitoUserId = idTokenPayload?.sub;
+      if (cognitoUserId) {
+        await dynamo.send(
+          new UpdateCommand({
+            TableName: USERS_TABLE_NAME,
+            Key: { userId: cognitoUserId },
+            // if_not_exists: bu satırda zaten bir hash varsa (normal --
+            // her girişte AYNI değer olurdu zaten) üzerine yazmaya
+            // gerek yok, gereksiz bir yazma önleniyor.
+            UpdateExpression: "SET appleUserIdHash = if_not_exists(appleUserIdHash, :hash)",
+            ExpressionAttributeValues: { ":hash": appleUserIdHash },
+          })
+        );
+      }
+    } catch (hashErr) {
+      // BİLİNÇLİ: bu adım BAŞARISIZ olsa bile girişin kendisi
+      // engellenmemeli -- kullanıcı yine de giriş yapabilsin, sadece bu
+      // durumda (çok nadir bir DynamoDB hatası) jeton-istismarı koruması
+      // o kullanıcı için devreye girmeyebilir (aşağı yönlü, kabul
+      // edilebilir bir risk -- girişin kendisini engellemekten çok
+      // daha az kötü).
+      console.error("appleUserIdHash yazılamadı (giriş yine de devam ediyor):", hashErr);
+    }
 
     return {
       statusCode: 200,
