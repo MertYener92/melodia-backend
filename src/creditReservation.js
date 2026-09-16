@@ -144,7 +144,7 @@ async function reserveCredits(userId, cost) {
         },
       })
     );
-    return { allowed: true, remaining: limit - cost, limit, period, plan };
+    return { allowed: true, remaining: limit - cost, limit, period, plan, source: "periodic" };
   } catch (err) {
     if (err.name !== "ConditionalCheckFailedException") throw err;
     // Dönem zaten mevcut dönemle eşleşiyor (normal durum) -- ADIM 2.
@@ -171,7 +171,39 @@ async function reserveCredits(userId, cost) {
         },
       })
     );
-    return { allowed: true, remaining: maxBeforeAdd, limit, period, plan };
+    return { allowed: true, remaining: maxBeforeAdd, limit, period, plan, source: "periodic" };
+  } catch (err) {
+    if (err.name !== "ConditionalCheckFailedException") throw err;
+    // Periyodik havuz (abonelik/ücretsiz deneme) tükendi -- ADIM 3'e düş.
+  }
+
+  // YENİ (kredi paketleri): periyodik havuz tükendiğinde, satın alınmış
+  // (süresi dolmayan) bonus kredi bakiyesinden düşmeyi dene. AYNI atomik
+  // desen: koşullu ADD, sadece yeterli bakiye varsa geçer.
+  try {
+    const { Attributes } = await client.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { userId },
+        UpdateExpression: "ADD bonusCredits :negCost SET updatedAt = :now",
+        ConditionExpression:
+          "attribute_exists(bonusCredits) AND bonusCredits >= :cost",
+        ExpressionAttributeValues: {
+          ":negCost": -cost,
+          ":cost": cost,
+          ":now": now,
+        },
+        ReturnValues: "UPDATED_NEW",
+      })
+    );
+    return {
+      allowed: true,
+      remaining: Attributes.bonusCredits,
+      limit,
+      period: null,
+      plan,
+      source: "bonus",
+    };
   } catch (err) {
     if (err.name === "ConditionalCheckFailedException") {
       const { Item: user } = await client.send(
@@ -187,7 +219,48 @@ async function reserveCredits(userId, cost) {
 // Suno/Lyria isteği KALICI olarak reddedildiğinde rezerve edilen
 // krediyi atomik ve TAM OLARAK BİR KEZ iade eder. Job kaydına bağlı
 // (creditRefunded bayrağıyla) idempotency İÇİN transaction kullanır.
-async function refundCredits(userId, jobId, cost, period) {
+// YENİ (kredi paketleri): source 'periodic' ya da 'bonus' olabilir --
+// hangi havuzdan düşüldüyse iade AYNI havuza gitmeli.
+async function refundCredits(userId, jobId, cost, period, source = "periodic") {
+  if (source === "bonus") {
+    try {
+      await client.send(
+        new TransactWriteCommand({
+          TransactItems: [
+            {
+              Update: {
+                TableName: TABLE_NAME,
+                Key: { userId },
+                UpdateExpression: "ADD bonusCredits :cost SET updatedAt = :now",
+                ExpressionAttributeValues: {
+                  ":cost": cost,
+                  ":now": new Date().toISOString(),
+                },
+              },
+            },
+            {
+              Update: {
+                TableName: JOBS_TABLE_NAME,
+                Key: { jobId },
+                UpdateExpression: "SET creditRefunded = :true",
+                ConditionExpression:
+                  "attribute_not_exists(creditRefunded) OR creditRefunded = :false",
+                ExpressionAttributeValues: { ":true": true, ":false": false },
+              },
+            },
+          ],
+        })
+      );
+      return true;
+    } catch (err) {
+      if (err.name === "TransactionCanceledException") {
+        console.warn(`Bonus kredi iadesi atlandı (job ${jobId}): muhtemelen zaten iade edilmiş.`);
+        return false;
+      }
+      throw err;
+    }
+  }
+
   if (!period) return false; // eski/eksik kayıt -- iade edilecek dönem bilgisi yok
   try {
     await client.send(
@@ -246,7 +319,19 @@ async function refundCredits(userId, jobId, cost, period) {
 // stale-claim sonrası tekrar deneme riskiyle KARIŞTIRILMAMALI (o risk
 // SADECE gerçek job'lar için var, bu yol hiç job oluşmadığında devreye
 // giriyor).
-async function refundCreditsStandalone(userId, cost, period) {
+async function refundCreditsStandalone(userId, cost, period, source = "periodic") {
+  if (source === "bonus") {
+    await client.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { userId },
+        UpdateExpression: "ADD bonusCredits :cost SET updatedAt = :now",
+        ExpressionAttributeValues: { ":cost": cost, ":now": new Date().toISOString() },
+      })
+    );
+    return true;
+  }
+
   if (!period) return false;
   try {
     await client.send(

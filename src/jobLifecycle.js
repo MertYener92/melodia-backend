@@ -109,7 +109,8 @@ async function markFailed(job, message) {
       job.userId,
       job.jobId,
       job.creditReservation.cost,
-      job.creditReservation.period
+      job.creditReservation.period,
+      job.creditReservation.source || "periodic"
     );
   }
   await client.send(

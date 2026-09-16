@@ -12,3 +12,9 @@ verify-sub-env*.json
 live-*.json
 live-*.txt
 gercek-deployed-template.json
+
+apple-auth-env*.json
+verify-sub-env*.json
+live-*.json
+live-*.txt
+gercek-deployed-template.json

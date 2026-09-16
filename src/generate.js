@@ -4,6 +4,7 @@ const { DynamoDBDocumentClient, PutCommand } = require("@aws-sdk/lib-dynamodb");
 const { SQSClient, SendMessageCommand } = require("@aws-sdk/client-sqs");
 const { checkRateLimit, rateLimitResponse } = require("./rateLimit");
 const { reserveCredits, refundCreditsStandalone, QuotaExceededError } = require("./creditReservation");
+const { songCreditCostForMode } = require("./creditPlans");
 
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const sqs = new SQSClient({});
@@ -13,7 +14,11 @@ const JOBS_TABLE_NAME = process.env.JOBS_TABLE_NAME;
 // hızlı submission akışının Lambda concurrency slotlarını tüketemez.
 const GENERATION_QUEUE_URL = process.env.GENERATION_QUEUE_URL; // Suno
 const LYRIA_GENERATION_QUEUE_URL = process.env.LYRIA_GENERATION_QUEUE_URL;
-const SONG_CREDIT_COST = Number(process.env.SONG_CREDIT_COST || 1);
+// KALDIRILDI (JETON SİSTEMİ x10 GÜNCELLEMESİ): sabit, tek bir
+// SONG_CREDIT_COST env var'ı yerine artık maliyet body.mode'a göre
+// (bkz. songCreditCostForMode, creditPlans.js) İSTEK ANINDA hesaplanıyor
+// -- Hızlı/Standart 10 jeton, Gelişmiş 20 jeton. Suno bir generation'da
+// 2 şarkı döndürse bile bu maliyet JOB BAŞINA tek sefer uygulanıyor.
 // YENİ (madde 6 — webhook authentication): Suno/Lyria bize dönerken
 // callBackUrl'e eklenen paylaşılan secret. Global env değişkeni olarak
 // Secrets Manager'dan deploy anında çözülüyor (SUNO_API_KEY ile aynı
@@ -37,8 +42,16 @@ const SUNO_CALLBACK_SECRET = process.env.SUNO_CALLBACK_SECRET;
 exports.handler = async (event) => {
   const userId = event.requestContext.authorizer.claims.sub;
   let reservation = null;
+  let songCost = null;
 
   try {
+    const body = JSON.parse(event.body || "{}");
+    // YENİ (JETON SİSTEMİ x10 GÜNCELLEMESİ): maliyet artık body.mode'a
+    // göre hesaplanıyor -- Flutter tarafı 'fast' | 'standard' | 'advanced'
+    // gönderiyor. Bilinmeyen/eksik mod 'standard' maliyetine (10) düşer,
+    // bkz. songCreditCostForMode (creditPlans.js).
+    songCost = songCreditCostForMode(body.mode);
+
     // 1) HIZ SINIRI — jeton kontrolüne (DynamoDB okuma/yazma) bile
     // gitmeden önce en ucuz ve en hızlı reddi burada yapıyoruz.
     const rl = await checkRateLimit(userId, "generate", 5, 60);
@@ -48,21 +61,20 @@ exports.handler = async (event) => {
 
     // 2) KREDİ REZERVASYONU — atomik, TOCTOU'suz (madde 1).
     try {
-      reservation = await reserveCredits(userId, SONG_CREDIT_COST);
+      reservation = await reserveCredits(userId, songCost);
     } catch (err) {
       if (err instanceof QuotaExceededError) {
         return {
           statusCode: 429,
           body: JSON.stringify({
             error: "quota_exceeded",
-            message: `Bu ayki jeton hakkınız yetersiz (kalan: ${err.remaining}, gereken: ${SONG_CREDIT_COST}).`,
+            message: `Bu ayki jeton hakkınız yetersiz (kalan: ${err.remaining}, gereken: ${songCost}).`,
           }),
         };
       }
       throw err;
     }
 
-    const body = JSON.parse(event.body || "{}");
     const callBackUrl = `https://${event.headers.Host}/${event.requestContext.stage}/suno-callback?key=${encodeURIComponent(SUNO_CALLBACK_SECRET)}`;
     const jobId = crypto.randomUUID();
     const nowIso = new Date().toISOString();
@@ -82,8 +94,9 @@ exports.handler = async (event) => {
           provider,
           status: "queued", // queued -> submitting -> ready | failed
           creditReservation: {
-            cost: SONG_CREDIT_COST,
+            cost: songCost,
             period: reservation.period,
+            source: reservation.source,
           },
           creditRefunded: false,
           payload: {
@@ -94,6 +107,10 @@ exports.handler = async (event) => {
             vocalGender: body.vocalGender || null,
             durationSeconds: body.durationSeconds || null,
             lyricsLanguage: body.lyricsLanguage || null,
+            // YENİ: sadece izlenebilirlik için saklanıyor (worker bunu
+            // okumuyor) -- hangi modun ne maliyete/sonuca yol açtığını
+            // loglardan/DB'den takip edebilmek için.
+            mode: body.mode || null,
           },
           callBackUrl,
           createdAt: nowIso,
@@ -131,7 +148,7 @@ exports.handler = async (event) => {
     // ağıdır; yalnızca job hiç kuyruğa giremediyse devreye girer.)
     if (reservation) {
       try {
-        await refundCreditsStandalone(userId, SONG_CREDIT_COST, reservation.period);
+        await refundCreditsStandalone(userId, songCost, reservation.period, reservation.source);
       } catch (refundErr) {
         console.error("Telafi edici iade de başarısız oldu:", refundErr);
       }

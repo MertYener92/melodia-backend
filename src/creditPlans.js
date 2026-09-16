@@ -3,10 +3,15 @@
 // tek seferlik satın alınan, süresi dolmayan) geçti — bkz. melodia-video/
 // src/createVideoProject.js.
 //
+// DEĞİŞTİ (JETON SİSTEMİ x10 GÜNCELLEMESİ): Önceden "1 credit = 1 şarkı"
+// idi. Artık üretim maliyeti moda göre değişiyor (bkz. SONG_CREDIT_COST_BY_MODE
+// aşağıda: Hızlı/Standart = 10 jeton, Gelişmiş = 20 jeton) ve plan
+// limitleri buna göre x10 (ve biraz üstü) ölçeklendi.
+//
 // ÜÇ PLAN, İKİ FARKLI SIFIRLAMA DÖNGÜSÜ:
-//  - pro_weekly:  25 jeton, HAFTALIK sıfırlanır
-//  - pro_monthly: 120 jeton, AYLIK sıfırlanır
-//  - pro_yearly:  120 jeton, AYLIK sıfırlanır (tıpkı pro_monthly gibi —
+//  - pro_weekly:  250 jeton, HAFTALIK sıfırlanır
+//  - pro_monthly: 1000 jeton, AYLIK sıfırlanır
+//  - pro_yearly:  3000 jeton, AYLIK sıfırlanır (tıpkı pro_monthly gibi —
 //    yıllık ödeme sadece FATURALAMA sıklığını değiştiriyor, jeton mantığı
 //    pro_monthly ile birebir aynı; bu yüzden Apple'ın yıl içinde ekstra
 //    bir "yenileme" bildirimi göndermesine gerek YOK, sıfırlama tamamen
@@ -15,14 +20,35 @@ const AI_CREDIT_LIMITS = {
   // DÜZELTME: Önceden Number.MAX_SAFE_INTEGER'dı -- yani abonesi
   // olmayan/süresi geçmiş kullanıcı pratikte SINIRSIZ şarkı üretebiliyordu.
   // Artık "free" gerçek bir ömür boyu TEK SEFERLİK deneme jetonu:
-  // kullanıcı 1 şarkı üretebilir, sonra Pro'ya geçmeden bir daha
-  // üretemez. Bu periyodik (haftalık/aylık) sıfırlanmıyor -- bkz.
-  // currentPeriodKey'deki "lifetime" özel durumu.
-  free: 1,
-  pro_weekly: 25,
-  pro_monthly: 120,
-  pro_yearly: 120,
+  // 20 jeton = Hızlı/Standart'ta 2 şarkı, Gelişmiş'te 1 şarkı. Bu
+  // periyodik (haftalık/aylık) sıfırlanmıyor -- bkz. currentPeriodKey'deki
+  // "lifetime" özel durumu.
+  free: 20,
+  pro_weekly: 250,
+  pro_monthly: 1000,
+  pro_yearly: 3000,
 };
+
+// YENİ (JETON SİSTEMİ x10 GÜNCELLEMESİ): tek, global bir SONG_CREDIT_COST
+// yerine, üretim moduna göre değişen maliyet. Suno bir generation'da 2
+// şarkı döndürse bile maliyet GENERATION BAŞINA (yani job başına) TEK
+// SEFER uygulanır -- 2 şarkı için ayrı ayrı düşülmez (bkz. generate.js).
+// ÖNEMLİ: anahtarlar Flutter'ın library_mode_filter.dart'taki KENDİ mod
+// string'leriyle (quick/standard/advanced) BİREBİR aynı olmalı -- "Hızlı"
+// modun Flutter karşılığı 'fast' DEĞİL 'quick'.
+const SONG_CREDIT_COST_BY_MODE = {
+  quick: 10,
+  standard: 10,
+  advanced: 20,
+};
+
+// Bilinmeyen/eksik bir mod gelirse (ör. istemcinin eski bir sürümü ya da
+// mode hiç gönderilmezse) en düşük maliyete DEĞİL, en YAYGIN/güvenli
+// varsayılana (standard) düşüyoruz -- bu, backend'in kazara ucuza
+// üretim yapmasını önler.
+function songCreditCostForMode(mode) {
+  return SONG_CREDIT_COST_BY_MODE[mode] ?? SONG_CREDIT_COST_BY_MODE.standard;
+}
 
 function limitForPlan(plan) {
   return AI_CREDIT_LIMITS[plan] ?? AI_CREDIT_LIMITS.free;
@@ -58,4 +84,10 @@ function currentPeriodKey(plan, now = new Date()) {
   return `${now.getFullYear()}-${now.getMonth() + 1}`;
 }
 
-module.exports = { AI_CREDIT_LIMITS, limitForPlan, currentPeriodKey };
+module.exports = {
+  AI_CREDIT_LIMITS,
+  SONG_CREDIT_COST_BY_MODE,
+  songCreditCostForMode,
+  limitForPlan,
+  currentPeriodKey,
+};

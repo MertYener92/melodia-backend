@@ -10,14 +10,6 @@ Parameters:
   AppleBundleId:
     Type: String
     Default: "com.mertyener.melodia"
-  SongCreditCost:
-    Type: Number
-    Default: 1
-    Description: >
-      TAHMINI DEGER. Bir sarki uretimi kac jeton harcasin? melodia-video ve
-      melodia-music-spec ile AYNI birlesik jeton havuzundan dusuyor.
-      Gercek maliyet netlesince bu degeri degistirip sadece "sam deploy"
-      ile tekrar deploy et, koda dokunmana gerek yok.
   CloudFrontPublicKeyPem:
     Type: String
     Description: Audio dağıtımı için RSA public key PEM içeriği.
@@ -419,6 +411,13 @@ Resources:
       Policies:
         PasswordPolicy:
           MinimumLength: 8
+      # YENİ (jeton istismarı düzeltmesi — e-posta/şifre boşluğu): bkz.
+      # postConfirmation.js. E-posta/şifre ile kayıt appleAuth.js'e HİÇ
+      # uğramadığı için (Flutter -> doğrudan Cognito HTTP API), bu
+      # tetikleyici olmadan o yol için free-trial-abuse koruması ASLA
+      # devreye giremiyordu.
+      LambdaConfig:
+        PostConfirmation: !GetAtt PostConfirmationFunction.Arn
 
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
@@ -431,8 +430,39 @@ Resources:
         - ALLOW_REFRESH_TOKEN_AUTH
         - ALLOW_ADMIN_USER_PASSWORD_AUTH
 
+  # YENİ (jeton istismarı düzeltmesi — e-posta/şifre boşluğu): bkz.
+  # postConfirmation.js üstündeki uzun açıklama. Cognito'nun kendisi
+  # tarafından, e-posta onayı (ConfirmSignUp) başarılı olduğunda
+  # OTOMATİK ve ATLANAMAZ şekilde çağrılır -- SAM'in Api event'lerinin
+  # aksine, Cognito trigger'ları için çağırma izni SAM otomatik
+  # oluşturmuyor, bu yüzden aşağıdaki PostConfirmationFunctionCognitoPermission
+  # elle ekleniyor.
+  PostConfirmationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: postConfirmation.handler
+      Environment:
+        Variables:
+          FREE_TRIAL_LEDGER_TABLE_NAME: !Ref FreeTrialLedgerTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+              Resource: !GetAtt UsersTable.Arn
+
+  PostConfirmationFunctionCognitoPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PostConfirmationFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
   # DEĞİŞTİ: Artık Suno'yu doğrudan çağırmıyor — sadece kredi rezervasyonu
   # yapıp bir job kaydı oluşturuyor ve provider'a göre doğru kuyruğa
+
   # (Suno ya da Lyria) yazıyor. Bu yüzden Timeout kısaltıldı (ağır iş
   # artık burada değil).
   GenerateSongFunction:
@@ -443,7 +473,6 @@ Resources:
       Timeout: 15
       Environment:
         Variables:
-          SONG_CREDIT_COST: !Ref SongCreditCost
           JOBS_TABLE_NAME: !Ref GenerationJobsTable
           GENERATION_QUEUE_URL: !Ref MusicGenerationQueue
           # YENİ (madde 8): provider'a göre doğru kuyruğa yönlendirme.
@@ -749,9 +778,16 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: quota.handler
+      # YENİ (jeton istismarı düzeltmesi — /quota'nın yanlış "1 jeton
+      # var" göstermesi): bkz. quota.js üstündeki açıklama.
+      Environment:
+        Variables:
+          FREE_TRIAL_LEDGER_TABLE_NAME: !Ref FreeTrialLedgerTable
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref UsersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref FreeTrialLedgerTable
       Events:
         Api:
           Type: Api
@@ -931,6 +967,40 @@ Resources:
           Properties:
             RestApiId: !Ref MelodiaApi
             Path: /subscription/verify
+            Method: post
+
+  # YENİ (kredi paketleri): abonelik dışı, tek seferlik tüketilebilir
+  # kredi paketi satın almalarını doğrular. verifySubscription.js ile
+  # AYNI güvenlik deseni + IdempotencyTable üzerinden çift-kredi
+  # eklenmesini engelleyen ek bir koruma (bkz. verifyCreditPurchase.js).
+  VerifyCreditPurchaseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: verifyCreditPurchase.handler
+      Timeout: 20
+      Environment:
+        Variables:
+          APPLE_BUNDLE_ID: !Ref AppleBundleId
+          APPLE_IAP_ISSUER_ID: !Ref AppleIapIssuerId
+          APPLE_IAP_KEY_ID: !Ref AppleIapKeyId
+          APPLE_IAP_KEY_SECRET_ARN: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/apple-iap-private-key'
+          APPLE_IAP_ENVIRONMENT: !Ref AppleIapEnvironment
+          APPLE_APP_APPLE_ID: !Ref AppleAppAppleId
+          IDEMPOTENCY_TABLE_NAME: !Ref IdempotencyTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IdempotencyTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/apple-iap-private-key-*'
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /credits/verify-purchase
             Method: post
 
   # YENİ (Madde 11): Apple'ın App Store Server Notifications V2 webhook'u.
