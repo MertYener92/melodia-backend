@@ -46,6 +46,14 @@ exports.handler = async (event) => {
       mood: body.mood || "",
       isFavorite: body.isFavorite ?? false,
       taskId: body.taskId || "",
+      // DÜZELTME (kütüphane sekmesi hatası): "mode" (quick/standard/
+      // advanced) ve "provider" (suno/lyria) önceden HİÇ SAKLANMIYORDU --
+      // Flutter tarafı bu alanları listSongs.js'den geri okumaya
+      // çalışıyordu ama hep boş/varsayılan geliyordu, bu yüzden
+      // uygulama yeniden başlatıldığında şarkılar sadece "Tümü"
+      // sekmesinde görünüyordu (kendi mod sekmesinde değil).
+      mode: body.mode || null,
+      provider: body.provider || "suno",
       createdAt,
     };
 

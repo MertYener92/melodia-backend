@@ -896,6 +896,26 @@ Resources:
             Path: /songs/{songId}
             Method: delete
 
+  # YENİ (kütüphane favori kalıcılığı): favori durumunu HAFİF bir
+  # UpdateItem ile kaydeder -- saveSong.js'in aksine ses dosyasını S3'e
+  # yeniden kopyalamaz, bu yüzden ayrı bir fonksiyon.
+  UpdateSongFavoriteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: updateSongFavorite.handler
+      Timeout: 10
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SongsTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /songs/{songId}
+            Method: patch
+
   DeleteAccountFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -1087,7 +1107,7 @@ Resources:
           ThrottlingRateLimit: 1500 # saniyede sürekli izin verilen ortalama istek sayısı (tüm API, tüm kullanıcılar toplamı)
           ThrottlingBurstLimit: 3000 # anlık patlamalarda (ör. binlerce kullanıcının aynı anda pollamaya başlaması) tolerans
       Cors:
-        AllowMethods: "'GET,POST,DELETE,OPTIONS'"
+        AllowMethods: "'GET,POST,DELETE,PATCH,OPTIONS'"
         AllowHeaders: "'Content-Type,Authorization'"
         AllowOrigin: "'*'"
       Auth:

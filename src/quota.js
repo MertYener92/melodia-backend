@@ -75,6 +75,14 @@ exports.handler = async (event) => {
       // Flutter tarafı toplam kullanılabilir krediyi (remaining +
       // bonusCredits) gösterecek.
       bonusCredits: user?.bonusCredits || 0,
+      // YENİ (profil ekranı): appleAuth.js/postConfirmation.js
+      // tarafından hesap İLK KEZ oluşturulduğunda yazılıyor. Bu
+      // değişiklikten ÖNCE oluşturulmuş hesaplarda yok (null döner) --
+      // Flutter tarafı bu durumda "Üye olma tarihi"ni göstermeyecek.
+      createdAt: user?.createdAt || null,
+      // YENİ (profil ekranı "Yenilenme tarihi"): verifySubscription.js/
+      // appleNotifications.js tarafından yazılıyor, free planda null.
+      planExpiresAt: user?.planExpiresAt || null,
     }),
   };
 };

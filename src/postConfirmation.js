@@ -47,8 +47,16 @@ exports.handler = async (event) => {
         new UpdateCommand({
           TableName: USERS_TABLE_NAME,
           Key: { userId },
-          UpdateExpression: "SET appleUserIdHash = if_not_exists(appleUserIdHash, :hash)",
-          ExpressionAttributeValues: { ":hash": emailHash },
+          // YENİ (profil ekranı "Üye olma tarihi"): appleAuth.js ile
+          // AYNI if_not_exists deseni -- sadece hesap İLK KEZ
+          // oluşturulduğunda yazılır.
+          UpdateExpression:
+            "SET appleUserIdHash = if_not_exists(appleUserIdHash, :hash), " +
+            "createdAt = if_not_exists(createdAt, :now)",
+          ExpressionAttributeValues: {
+            ":hash": emailHash,
+            ":now": new Date().toISOString(),
+          },
         })
       );
     } catch (hashErr) {

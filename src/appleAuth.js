@@ -139,8 +139,16 @@ exports.handler = async (event) => {
             // if_not_exists: bu satırda zaten bir hash varsa (normal --
             // her girişte AYNI değer olurdu zaten) üzerine yazmaya
             // gerek yok, gereksiz bir yazma önleniyor.
-            UpdateExpression: "SET appleUserIdHash = if_not_exists(appleUserIdHash, :hash)",
-            ExpressionAttributeValues: { ":hash": appleUserIdHash },
+            // YENİ (profil ekranı "Üye olma tarihi"): AYNI if_not_exists
+            // deseniyle -- sadece hesap İLK KEZ oluşturulduğunda yazılır,
+            // sonraki girişlerde üzerine yazılmaz.
+            UpdateExpression:
+              "SET appleUserIdHash = if_not_exists(appleUserIdHash, :hash), " +
+              "createdAt = if_not_exists(createdAt, :now)",
+            ExpressionAttributeValues: {
+              ":hash": appleUserIdHash,
+              ":now": new Date().toISOString(),
+            },
           })
         );
       }

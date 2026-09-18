@@ -11,11 +11,13 @@
 // ÜÇ PLAN, İKİ FARKLI SIFIRLAMA DÖNGÜSÜ:
 //  - pro_weekly:  250 jeton, HAFTALIK sıfırlanır
 //  - pro_monthly: 1000 jeton, AYLIK sıfırlanır
-//  - pro_yearly:  3000 jeton, AYLIK sıfırlanır (tıpkı pro_monthly gibi —
-//    yıllık ödeme sadece FATURALAMA sıklığını değiştiriyor, jeton mantığı
-//    pro_monthly ile birebir aynı; bu yüzden Apple'ın yıl içinde ekstra
-//    bir "yenileme" bildirimi göndermesine gerek YOK, sıfırlama tamamen
-//    bizim tarafımızda, tarihe bakarak, tembel (lazy) şekilde hesaplanıyor)
+//  - pro_yearly:  250 jeton, AYLIK sıfırlanır (tıpkı pro_monthly gibi —
+//    yıllık ödeme sadece FATURALAMA sıklığını değiştiriyor; kullanıcı
+//    App Store açıklamasında "3.000 Jeton/yıl" görüyor ama bu YILLIK
+//    TOPLAM anlamına geliyor -- ay başına 3000÷12=250 jeton verilerek
+//    12 ayda toplam 3000'e ulaşılıyor. DÜZELTME: önceden burada yanlışlıkla
+//    3000 yazıyordu -- bu, aylık sıfırlanan bir dönemde HER AY 3000 (yılda
+//    36.000) vermek anlamına gelirdi, ciddi bir aşırı-verme hatasıydı.)
 const AI_CREDIT_LIMITS = {
   // DÜZELTME: Önceden Number.MAX_SAFE_INTEGER'dı -- yani abonesi
   // olmayan/süresi geçmiş kullanıcı pratikte SINIRSIZ şarkı üretebiliyordu.
@@ -26,7 +28,7 @@ const AI_CREDIT_LIMITS = {
   free: 20,
   pro_weekly: 250,
   pro_monthly: 1000,
-  pro_yearly: 3000,
+  pro_yearly: 250,
 };
 
 // YENİ (JETON SİSTEMİ x10 GÜNCELLEMESİ): tek, global bir SONG_CREDIT_COST
