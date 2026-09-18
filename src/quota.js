@@ -1,6 +1,11 @@
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 const { DynamoDBDocumentClient, GetCommand } = require("@aws-sdk/lib-dynamodb");
 const { limitForPlan, currentPeriodKey } = require("./creditPlans");
+// YENİ (Profile ekranı — avatar): avatarKey DB'de saklanıyor ama
+// AudioBucket PRIVATE olduğu için doğrudan gösterilemez -- şarkılarda
+// zaten kullanılan aynı CloudFront signed-URL mekanizmasıyla (bkz.
+// getSongPlayUrl.js) her /quota çağrısında taze bir signed URL üretilir.
+const { signMediaUrl } = require("./cloudfrontSigner");
 
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const TABLE_NAME = process.env.TABLE_NAME;
@@ -63,6 +68,21 @@ exports.handler = async (event) => {
     }
   }
 
+  // YENİ (Profile ekranı — "Complete your profile"): avatarKey varsa
+  // taze bir CloudFront signed URL üret. Şarkılardaki desenle aynı --
+  // her seferinde yeniden imzalanır, sonucu saatler sonra tekrar
+  // kullanma (bkz. getSongPlayUrl.js). Herhangi bir sebeple imzalama
+  // başarısız olursa /quota'yı ASLA hataya düşürmüyoruz -- avatar
+  // gösterilmez, gerisi normal çalışmaya devam eder.
+  let avatarUrl = null;
+  if (user?.avatarKey) {
+    try {
+      avatarUrl = await signMediaUrl(user.avatarKey, 60 * 60 * 24);
+    } catch (err) {
+      console.error("Avatar URL imzalanamadı (quota yine de dönüyor):", err);
+    }
+  }
+
   return {
     statusCode: 200,
     body: JSON.stringify({
@@ -83,6 +103,17 @@ exports.handler = async (event) => {
       // YENİ (profil ekranı "Yenilenme tarihi"): verifySubscription.js/
       // appleNotifications.js tarafından yazılıyor, free planda null.
       planExpiresAt: user?.planExpiresAt || null,
+      // YENİ (Complete Your Profile akışı) — updateProfile.js tarafından
+      // yazılır. Hiçbiri henüz doldurulmadıysa hepsi null/boş döner,
+      // Flutter tarafı bu durumda "Complete Your Profile" kartını
+      // Step 0/4 olarak gösterir.
+      displayName: user?.displayName || null,
+      avatarUrl,
+      favoriteGenres: user?.favoriteGenres || [],
+      moodPreference: user?.moodPreference || null,
+      creationGoal: user?.creationGoal || null,
+      profileStep: user?.profileStep || 0,
+      profileCompleted: user?.profileCompleted === true,
     }),
   };
 };

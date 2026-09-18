@@ -354,7 +354,9 @@ Resources:
             Principal:
               Service: cloudfront.amazonaws.com
             Action: s3:GetObject
-            Resource: !Sub "${AudioBucket.Arn}/songs/*"
+            Resource:
+              - !Sub "${AudioBucket.Arn}/songs/*"
+              - !Sub "${AudioBucket.Arn}/avatars/*"
             Condition:
               StringEquals:
                 AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${AudioDistribution}"
@@ -788,6 +790,11 @@ Resources:
             TableName: !Ref UsersTable
         - DynamoDBReadPolicy:
             TableName: !Ref FreeTrialLedgerTable
+        # YENİ: avatarUrl imzalamak için (bkz. quota.js -> cloudfrontSigner.js)
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref CloudFrontPrivateKeySecretArn
       Events:
         Api:
           Type: Api
@@ -795,6 +802,45 @@ Resources:
             RestApiId: !Ref MelodiaApi
             Path: /quota
             Method: get
+
+  # YENİ (Complete Your Profile akışı): profilin bir bölümünü kısmi
+  # olarak günceller (isim/avatar/tür/mood/hedef + adım numarası).
+  UpdateProfileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: updateProfile.handler
+      Timeout: 15
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /profile
+            Method: post
+
+  # YENİ (avatar yükleme): S3'e DOĞRUDAN yükleme için presigned PUT URL
+  # üretir -- audioStorage.js'deki getPresignedAudioUrl (GET) ile AYNI
+  # desen, ters yönde.
+  AvatarUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: avatarUploadUrl.handler
+      Timeout: 15
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref AudioBucket
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MelodiaApi
+            Path: /profile/avatar-upload-url
+            Method: post
 
   LyricsTimestampsFunction:
     Type: AWS::Serverless::Function
@@ -1112,6 +1158,14 @@ Resources:
         AllowOrigin: "'*'"
       Auth:
         DefaultAuthorizer: CognitoAuth
+        # DÜZELTME (tarayıcıda "ClientException: Failed to fetch"): SAM'in
+        # bu ayarı VARSAYILAN olarak true'dur ve CognitoAuth'u, CORS için
+        # otomatik üretilen OPTIONS (preflight) metotlarına DA ekler.
+        # Tarayıcı preflight'ı Authorization başlığı OLMADAN gönderdiği
+        # için her preflight 401 dönüyor, asıl istek hiç gönderilmiyordu --
+        # yani Flutter Web'de /profile, /quota, /songs dahil TÜM backend
+        # çağrıları kırıktı (mobilde CORS olmadığı için sorun görünmüyordu).
+        AddDefaultAuthorizerToCorsPreflight: false
         Authorizers:
           CognitoAuth:
             UserPoolArn: !GetAtt UserPool.Arn
