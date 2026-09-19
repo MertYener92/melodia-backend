@@ -1,5 +1,6 @@
 const { sunoFetch } = require("./sunoProxy");
 const { checkRateLimit, rateLimitResponse } = require("./rateLimit");
+const { isLyricsTaskOwner } = require("./lyricsTaskOwnership");
 
 exports.handler = async (event) => {
   try {
@@ -14,6 +15,11 @@ exports.handler = async (event) => {
     const taskId = event.queryStringParameters?.taskId;
     if (!taskId) {
       return { statusCode: 400, body: JSON.stringify({ error: "taskId gerekli." }) };
+    }
+
+    // GÜVENLİK (SORUN 2754): sadece görevi başlatan kullanıcı sorgulayabilir.
+    if (!(await isLyricsTaskOwner(taskId, userId))) {
+      return { statusCode: 404, body: JSON.stringify({ error: "task_not_found" }) };
     }
 
     const { ok, status, data } = await sunoFetch(

@@ -118,63 +118,77 @@ async function reserveCredits(userId, cost) {
   // pro planlarda VEYA aynı hesabın normal (dönem zaten eşleşen) ikinci+
   // isteklerinde bu kontrol HİÇ çalışmaz, mevcut refund/retry akışlarını
   // etkilemez.
+  //
+  // DÜZELTME (SORUN 2754 #9): ücretsiz deneme hakkı daha önce kullanılmışsa
+  // SADECE periyodik (ücretsiz) havuz kapanır -- önceden hata doğrudan
+  // fırlatılıp ADIM 3'e (satın alınmış bonus jeton) hiç geçilmiyordu;
+  // aboneliği biten ya da hesabını silip yeniden açan kullanıcı SATIN
+  // ALDIĞI jetonları kullanamıyordu.
+  let periodicAvailable = true;
   if (plan === "free" && aiCreditsPeriod !== period) {
-    await claimFreeTrialOrThrow(appleUserIdHash);
+    try {
+      await claimFreeTrialOrThrow(appleUserIdHash);
+    } catch (err) {
+      if (!(err instanceof QuotaExceededError)) throw err;
+      periodicAvailable = false;
+    }
   }
 
   const now = new Date().toISOString();
 
-  try {
-    await client.send(
-      new UpdateCommand({
-        TableName: TABLE_NAME,
-        Key: { userId },
-        UpdateExpression:
-          "SET aiCreditsUsed = :cost, aiCreditsPeriod = :period, updatedAt = :now, " +
-          "#plan = if_not_exists(#plan, :freePlan)",
-        ConditionExpression:
-          "(attribute_not_exists(aiCreditsPeriod) OR aiCreditsPeriod <> :period) AND :cost <= :limit",
-        ExpressionAttributeNames: { "#plan": "plan" },
-        ExpressionAttributeValues: {
-          ":cost": cost,
-          ":period": period,
-          ":now": now,
-          ":freePlan": "free",
-          ":limit": limit,
-        },
-      })
-    );
-    return { allowed: true, remaining: limit - cost, limit, period, plan, source: "periodic" };
-  } catch (err) {
-    if (err.name !== "ConditionalCheckFailedException") throw err;
-    // Dönem zaten mevcut dönemle eşleşiyor (normal durum) -- ADIM 2.
-  }
+  if (periodicAvailable) {
+    try {
+      await client.send(
+        new UpdateCommand({
+          TableName: TABLE_NAME,
+          Key: { userId },
+          UpdateExpression:
+            "SET aiCreditsUsed = :cost, aiCreditsPeriod = :period, updatedAt = :now, " +
+            "#plan = if_not_exists(#plan, :freePlan)",
+          ConditionExpression:
+            "(attribute_not_exists(aiCreditsPeriod) OR aiCreditsPeriod <> :period) AND :cost <= :limit",
+          ExpressionAttributeNames: { "#plan": "plan" },
+          ExpressionAttributeValues: {
+            ":cost": cost,
+            ":period": period,
+            ":now": now,
+            ":freePlan": "free",
+            ":limit": limit,
+          },
+        })
+      );
+      return { allowed: true, remaining: limit - cost, limit, period, plan, source: "periodic" };
+    } catch (err) {
+      if (err.name !== "ConditionalCheckFailedException") throw err;
+      // Dönem zaten mevcut dönemle eşleşiyor (normal durum) -- ADIM 2.
+    }
 
-  const maxBeforeAdd = limit - cost;
-  try {
-    await client.send(
-      new UpdateCommand({
-        TableName: TABLE_NAME,
-        Key: { userId },
-        UpdateExpression:
-          "ADD aiCreditsUsed :cost SET updatedAt = :now, #plan = if_not_exists(#plan, :freePlan)",
-        ConditionExpression:
-          "aiCreditsPeriod = :period AND " +
-          "(attribute_not_exists(aiCreditsUsed) OR aiCreditsUsed <= :maxBeforeAdd)",
-        ExpressionAttributeNames: { "#plan": "plan" },
-        ExpressionAttributeValues: {
-          ":cost": cost,
-          ":period": period,
-          ":now": now,
-          ":freePlan": "free",
-          ":maxBeforeAdd": maxBeforeAdd,
-        },
-      })
-    );
-    return { allowed: true, remaining: maxBeforeAdd, limit, period, plan, source: "periodic" };
-  } catch (err) {
-    if (err.name !== "ConditionalCheckFailedException") throw err;
-    // Periyodik havuz (abonelik/ücretsiz deneme) tükendi -- ADIM 3'e düş.
+    const maxBeforeAdd = limit - cost;
+    try {
+      await client.send(
+        new UpdateCommand({
+          TableName: TABLE_NAME,
+          Key: { userId },
+          UpdateExpression:
+            "ADD aiCreditsUsed :cost SET updatedAt = :now, #plan = if_not_exists(#plan, :freePlan)",
+          ConditionExpression:
+            "aiCreditsPeriod = :period AND " +
+            "(attribute_not_exists(aiCreditsUsed) OR aiCreditsUsed <= :maxBeforeAdd)",
+          ExpressionAttributeNames: { "#plan": "plan" },
+          ExpressionAttributeValues: {
+            ":cost": cost,
+            ":period": period,
+            ":now": now,
+            ":freePlan": "free",
+            ":maxBeforeAdd": maxBeforeAdd,
+          },
+        })
+      );
+      return { allowed: true, remaining: maxBeforeAdd, limit, period, plan, source: "periodic" };
+    } catch (err) {
+      if (err.name !== "ConditionalCheckFailedException") throw err;
+      // Periyodik havuz (abonelik/ücretsiz deneme) tükendi -- ADIM 3'e düş.
+    }
   }
 
   // YENİ (kredi paketleri): periyodik havuz tükendiğinde, satın alınmış
@@ -206,6 +220,7 @@ async function reserveCredits(userId, cost) {
     };
   } catch (err) {
     if (err.name === "ConditionalCheckFailedException") {
+      if (!periodicAvailable) throw new QuotaExceededError(0, limit);
       const { Item: user } = await client.send(
         new GetCommand({ TableName: TABLE_NAME, Key: { userId } })
       );

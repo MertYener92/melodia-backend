@@ -52,6 +52,38 @@ exports.handler = async (event) => {
       updates.displayName = trimmed;
     }
 
+    // GÜVENLİK DÜZELTMESİ (SORUN 2754 #13): avatarKey sadece kullanıcının
+    // KENDİ avatar klasörünü gösterebilir. Önceden serbestti -- /quota bu
+    // anahtarı CloudFront ile imzaladığı için başka bir kullanıcının şarkı
+    // dosyası (songs/<başkası>/...) için imzalı link alınabiliyordu.
+    if (updates.avatarKey !== undefined) {
+      const key = String(updates.avatarKey);
+      if (!key.startsWith(`avatars/${userId}/`) || key.includes("..") || key.length > 200) {
+        return {
+          statusCode: 400,
+          body: JSON.stringify({ error: "Geçersiz avatar." }),
+        };
+      }
+      updates.avatarKey = key;
+    }
+
+    for (const field of ["moodPreference", "creationGoal"]) {
+      if (updates[field] !== undefined) {
+        updates[field] = String(updates[field]).slice(0, 100);
+      }
+    }
+
+    if (updates.profileStep !== undefined) {
+      const step = Number(updates.profileStep);
+      if (!Number.isInteger(step) || step < 0 || step > 10) {
+        return {
+          statusCode: 400,
+          body: JSON.stringify({ error: "Geçersiz profileStep." }),
+        };
+      }
+      updates.profileStep = step;
+    }
+
     if (updates.favoriteGenres !== undefined) {
       if (!Array.isArray(updates.favoriteGenres)) {
         return {
@@ -60,7 +92,7 @@ exports.handler = async (event) => {
         };
       }
       updates.favoriteGenres = updates.favoriteGenres
-        .map((g) => String(g))
+        .map((g) => String(g).slice(0, 40))
         .slice(0, 5);
     }
 

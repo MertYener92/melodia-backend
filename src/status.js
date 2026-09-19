@@ -9,6 +9,7 @@ const {
   writeSunoStatusCache,
   findJobByTaskId,
 } = require("./sunoStatusCache");
+const { refundCredits } = require("./creditReservation");
 
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const JOBS_TABLE_NAME = process.env.JOBS_TABLE_NAME;
@@ -75,7 +76,32 @@ async function fallbackLivePoll(job) {
   };
   // Sonucu cache'e yaz -- webhook hiç gelmese BİLE bir sonraki 18sn'lik
   // pencerede tekrar canlı sormaya gerek kalmadan bu değer kullanılır.
-  await writeSunoStatusCache(job.jobId, fresh);
+  const wrote = await writeSunoStatusCache(job.jobId, fresh);
+
+  // DÜZELTME (SORUN 2754 #8): webhook kaçtıysa üretimin BAŞARISIZ olduğunu
+  // ilk öğrenen yer burası -- önceden iade SADECE sunoCallback.js'te
+  // yapılıyordu, bu yoldan gelen başarısızlıkta kullanıcının jetonu
+  // gidiyordu. sunoCallback ile aynı kural: sadece bu "başarısız" yazısı
+  // gerçekten kazandıysa (monotonic koruma) iade et; refundCredits zaten
+  // job başına TEK sefer (creditRefunded bayrağı) çalışır.
+  if (
+    wrote &&
+    job.creditReservation &&
+    isFinalStatus(fresh.sunoTaskStatus) &&
+    fresh.sunoTaskStatus !== SUNO_STATUS.SUCCESS
+  ) {
+    try {
+      await refundCredits(
+        job.userId,
+        job.jobId,
+        job.creditReservation.cost,
+        job.creditReservation.period,
+        job.creditReservation.source || "periodic"
+      );
+    } catch (err) {
+      console.error(`Job ${job.jobId}: başarısız üretim iadesi yapılamadı:`, err);
+    }
+  }
   return sunoJobToResponseBody(job, fresh);
 }
 

@@ -1,5 +1,8 @@
 const { sunoFetch } = require("./sunoProxy");
 const { checkRateLimit, rateLimitResponse } = require("./rateLimit");
+const { recordLyricsTaskOwner } = require("./lyricsTaskOwnership");
+
+const SUNO_CALLBACK_SECRET = process.env.SUNO_CALLBACK_SECRET;
 
 exports.handler = async (event) => {
   try {
@@ -14,7 +17,9 @@ exports.handler = async (event) => {
     // Suno bu alanı zorunlu tutuyor; içeriğiyle ilgilenmiyoruz, sonucu
     // /lyrics-status ile polling yapıyoruz. URL'i gelen isteğin kendi
     // adresinden anlık hesaplıyoruz (döngüsel bağımlılık olmasın diye).
-    const callBackUrl = `https://${event.headers.Host}/${event.requestContext.stage}/suno-callback`;
+    // DÜZELTME (SORUN 2754): secret eklendi -- önceden eksikti, Suno'nun söz
+    // callback'leri sunoCallback.js'te 401 alıyordu.
+    const callBackUrl = `https://${event.headers.Host}/${event.requestContext.stage}/suno-callback?key=${encodeURIComponent(SUNO_CALLBACK_SECRET)}`;
 
     const { ok, status, data } = await sunoFetch("/api/v1/lyrics", {
       method: "POST",
@@ -30,6 +35,9 @@ exports.handler = async (event) => {
         body: JSON.stringify({ error: data.msg || "Söz üretimi başlatılamadı." }),
       };
     }
+
+    // Görevi kimin başlattığını kaydet -- /lyrics-status sadece sahibine cevap verir.
+    await recordLyricsTaskOwner(data.data.taskId, userId);
 
     return {
       statusCode: 200,
