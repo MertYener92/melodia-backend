@@ -42,6 +42,11 @@ const SONG_CREDIT_COST_BY_MODE = {
   quick: 10,
   standard: 10,
   advanced: 20,
+  // YENİ (Remix): mevcut bir şarkının Suno "upload-cover" ile yeni bir
+  // tarzda yeniden üretilmesi. Suno tarafında tam bir üretim olduğu için
+  // maliyeti Standart ile aynı; daha ucuz olursa normal üretimi atlatmanın
+  // yolu haline gelir. Bkz. generate.js (remixOf).
+  remix: 10,
 };
 
 // Bilinmeyen/eksik bir mod gelirse (ör. istemcinin eski bir sürümü ya da

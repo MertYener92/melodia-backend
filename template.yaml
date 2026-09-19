@@ -502,6 +502,10 @@ Resources:
             QueueName: !GetAtt MusicGenerationQueue.QueueName
         - SQSSendMessagePolicy:
             QueueName: !GetAtt LyriaGenerationQueue.QueueName
+        # YENİ (Remix): kaynak şarkıyı kullanıcının kendi kütüphanesinden
+        # okumak için (sadece GetItem).
+        - DynamoDBReadPolicy:
+            TableName: !Ref SongsTable
       Events:
         Api:
           Type: Api
@@ -552,6 +556,12 @@ Resources:
                 - !GetAtt GenerationJobsTable.Arn
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
+        # YENİ (Remix): kaynak şarkı için CloudFront imzalı URL üretip
+        # Suno'nun upload-cover'ına vermek üzere (bkz. cloudfrontSigner.js).
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref CloudFrontPrivateKeySecretArn
       Events:
         GenerationQueueEvent:
           Type: SQS
