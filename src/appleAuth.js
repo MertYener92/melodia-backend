@@ -47,7 +47,7 @@ async function verifyAppleToken(identityToken) {
 exports.handler = async (event) => {
   try {
     const body = JSON.parse(event.body || "{}");
-    const { identityToken, email: appleProvidedEmail } = body;
+    const { identityToken } = body;
 
     if (!identityToken) {
       return { statusCode: 400, body: JSON.stringify({ error: "identityToken gerekli." }) };
@@ -55,8 +55,15 @@ exports.handler = async (event) => {
 
     const payload = await verifyAppleToken(identityToken);
     const appleUserId = payload.sub;
-    const email = payload.email || appleProvidedEmail;
-    if (!email) {
+    // GÜVENLİK DÜZELTMESİ (SORUN 2754 #1): e-posta SADECE Apple'ın imzaladığı
+    // token'dan alınır ve Apple tarafından doğrulanmış olmalıdır. Önceden
+    // token'da e-posta yoksa istemcinin gönderdiği e-posta kullanılıyordu --
+    // e-posta claim'i olmayan geçerli bir Apple token'ı ile İSTENEN herhangi
+    // bir e-postanın hesabına girilebiliyordu (aşağıda şifre sıfırlanıp oturum
+    // açıldığı için tam hesap ele geçirme).
+    const email = typeof payload.email === "string" ? payload.email : "";
+    const emailVerified = payload.email_verified === true || payload.email_verified === "true";
+    if (!email || !emailVerified) {
       return { statusCode: 400, body: JSON.stringify({ error: "E-posta bilgisi alınamadı." }) };
     }
 
@@ -81,7 +88,9 @@ exports.handler = async (event) => {
       else throw err;
     }
 
-    const randomPassword = `Ap!${appleUserId.slice(0, 20)}${Date.now()}`;
+    // Tahmin edilemez tek kullanımlık şifre (önceden Apple sub + Date.now
+    // idi). Sonek, olası şifre politikası karakter kurallarını karşılar.
+    const randomPassword = `${crypto.randomBytes(24).toString("base64url")}Aa1!`;
 
     if (!userExists) {
       await cognito.send(

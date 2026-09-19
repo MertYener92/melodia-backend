@@ -1,10 +1,82 @@
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
-const { DynamoDBDocumentClient, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
+const {
+  DynamoDBDocumentClient,
+  UpdateCommand,
+  TransactWriteCommand,
+} = require("@aws-sdk/lib-dynamodb");
 const { verifyAndDecodeNotification, verifyAndDecodeTransaction } = require("./appleIap");
 const { planFromProductId } = require("./planMapping");
+const { creditsFromProductId } = require("./creditPackages");
 
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const TABLE_NAME = process.env.TABLE_NAME;
+const IDEMPOTENCY_TABLE_NAME = process.env.IDEMPOTENCY_TABLE_NAME;
+
+// YENİ (SORUN 2754 #12): iade edilen JETON PAKETİ (consumable). Önceden
+// REFUND bildirimi ürün tipine bakmadan kullanıcıyı "free" plana düşürüyordu
+// -- jeton paketi iadesi aboneliği iptal ediyor, iade edilen jetonlar ise
+// kullanıcıda kalıyordu. Artık sadece o paketin jetonları düşülüyor (bakiye
+// yetmiyorsa kalanı sıfırlanıyor), aynı iade iki kez işlenmiyor.
+async function refundCreditPackage(userId, transaction, credits) {
+  const refundKey = `credit-refund:${transaction.transactionId}`;
+  const now = new Date().toISOString();
+  const lockItem = {
+    Put: {
+      TableName: IDEMPOTENCY_TABLE_NAME,
+      Item: { idempotencyKey: refundKey, userId, credits, createdAt: now },
+      ConditionExpression: "attribute_not_exists(idempotencyKey)",
+    },
+  };
+
+  try {
+    await client.send(
+      new TransactWriteCommand({
+        TransactItems: [
+          lockItem,
+          {
+            Update: {
+              TableName: TABLE_NAME,
+              Key: { userId },
+              UpdateExpression: "ADD bonusCredits :neg SET updatedAt = :now",
+              ConditionExpression: "bonusCredits >= :credits",
+              ExpressionAttributeValues: { ":neg": -credits, ":credits": credits, ":now": now },
+            },
+          },
+        ],
+      })
+    );
+    return;
+  } catch (err) {
+    if (err.name !== "TransactionCanceledException") throw err;
+    const [lockReason] = (err.CancellationReasons || []).map((r) => r.Code);
+    if (lockReason === "ConditionalCheckFailed") {
+      console.log(`Jeton iadesi zaten işlenmiş: ${transaction.transactionId}`);
+      return;
+    }
+  }
+
+  // Jetonların bir kısmı zaten harcanmış: kalan bakiyeyi sıfırla.
+  try {
+    await client.send(
+      new TransactWriteCommand({
+        TransactItems: [
+          lockItem,
+          {
+            Update: {
+              TableName: TABLE_NAME,
+              Key: { userId },
+              UpdateExpression: "SET bonusCredits = :zero, updatedAt = :now",
+              ExpressionAttributeValues: { ":zero": 0, ":now": now },
+            },
+          },
+        ],
+      })
+    );
+  } catch (err) {
+    if (err.name === "TransactionCanceledException") return; // eşzamanlı işlendi
+    throw err;
+  }
+}
 
 // Apple'ın App Store Server Notifications V2 webhook'u. Kullanıcı
 // uygulamayı hiç açmasa bile (ör. gece bir abonelik otomatik yenilenince
@@ -46,27 +118,39 @@ exports.handler = async (event) => {
     }
 
     const type = notification.notificationType;
+    const plan = planFromProductId(transaction.productId);
+    const packageCredits = creditsFromProductId(transaction.productId);
+
+    // Jeton paketi (consumable) -- abonelik alanlarına HİÇ dokunulmaz.
+    if (packageCredits) {
+      if (type === "REFUND" || type === "REVOKE") {
+        await refundCreditPackage(userId, transaction, packageCredits);
+      } else {
+        console.log(`Jeton paketi için işlenmeyen bildirim tipi: ${type}`);
+      }
+      return { statusCode: 200, body: JSON.stringify({ received: true }) };
+    }
+
+    if (!plan) {
+      console.error(`Bildirimde bilinmeyen productId: ${transaction.productId}`);
+      return { statusCode: 200, body: JSON.stringify({ received: true }) };
+    }
 
     if (type === "SUBSCRIBED" || type === "DID_RENEW") {
-      const plan = planFromProductId(transaction.productId);
-      if (plan) {
-        await client.send(
-          new UpdateCommand({
-            TableName: TABLE_NAME,
-            Key: { userId },
-            UpdateExpression:
-              "SET #plan = :plan, planExpiresAt = :expiresAt, originalTransactionId = :otid",
-            ExpressionAttributeNames: { "#plan": "plan" },
-            ExpressionAttributeValues: {
-              ":plan": plan,
-              ":expiresAt": new Date(transaction.expiresDate).toISOString(),
-              ":otid": transaction.originalTransactionId,
-            },
-          })
-        );
-      } else {
-        console.error(`Bildirimde bilinmeyen productId: ${transaction.productId}`);
-      }
+      await client.send(
+        new UpdateCommand({
+          TableName: TABLE_NAME,
+          Key: { userId },
+          UpdateExpression:
+            "SET #plan = :plan, planExpiresAt = :expiresAt, originalTransactionId = :otid",
+          ExpressionAttributeNames: { "#plan": "plan" },
+          ExpressionAttributeValues: {
+            ":plan": plan,
+            ":expiresAt": new Date(transaction.expiresDate).toISOString(),
+            ":otid": transaction.originalTransactionId,
+          },
+        })
+      );
     } else if (
       type === "EXPIRED" ||
       type === "REFUND" ||
@@ -89,6 +173,6 @@ exports.handler = async (event) => {
     return { statusCode: 200, body: JSON.stringify({ received: true }) };
   } catch (err) {
     console.error(err);
-    return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
+    return { statusCode: 500, body: JSON.stringify({ error: "internal_error" }) };
   }
 };

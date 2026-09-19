@@ -12,12 +12,28 @@ const AUDIO_BUCKET_NAME = process.env.AUDIO_BUCKET_NAME;
 /// "ExpiredToken" sorunu gibi sessizce açılmaz hale gelir.
 ///
 /// Döndürdüğü "key", DB'ye YAZILACAK olan S3 object key'idir (URL değil).
+///
+/// GÜVENLİK (SORUN 2754 #13): sadece https ve en fazla MAX_AUDIO_BYTES --
+/// 8 dakikalık 320 kbps bir mp3 ~20 MB, bu sınır fazlasıyla yeterli ve
+/// Lambda belleğini dev bir dosyayla doldurmayı engeller.
+const MAX_AUDIO_BYTES = 40 * 1024 * 1024;
+
 async function copyExternalAudioToS3(externalUrl, userId, songId) {
+  if (!/^https:\/\//i.test(externalUrl)) {
+    throw new Error("Ses dosyası adresi geçersiz.");
+  }
   const res = await fetch(externalUrl, { signal: AbortSignal.timeout(30000) });
   if (!res.ok) {
     throw new Error(`Ses dosyası indirilemedi (HTTP ${res.status}).`);
   }
+  const declared = Number(res.headers.get("content-length") || 0);
+  if (declared > MAX_AUDIO_BYTES) {
+    throw new Error("Ses dosyası çok büyük.");
+  }
   const buffer = Buffer.from(await res.arrayBuffer());
+  if (buffer.length > MAX_AUDIO_BYTES) {
+    throw new Error("Ses dosyası çok büyük.");
+  }
   return uploadAudioBufferToS3(buffer, userId, songId);
 }
 

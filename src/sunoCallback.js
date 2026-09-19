@@ -145,11 +145,15 @@ exports.handler = async (event) => {
         sunoErrorMessage: body.msg || "Şarkı üretimi başarısız oldu.",
       });
       if (wrote && job.creditReservation) {
+        // DÜZELTME (SORUN 2754 #7): source eksikti -- bonus jetonla (satın
+        // alınmış paket) yapılan üretim başarısız olunca, iade "periodic"
+        // sanılıp period=null yüzünden sessizce atlanıyordu.
         await refundCredits(
           job.userId,
           job.jobId,
           job.creditReservation.cost,
-          job.creditReservation.period
+          job.creditReservation.period,
+          job.creditReservation.source || "periodic"
         );
       }
     }

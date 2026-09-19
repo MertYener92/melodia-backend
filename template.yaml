@@ -703,6 +703,19 @@ Resources:
             TableName: !Ref GenerationJobsTable
         - DynamoDBCrudPolicy:
             TableName: !Ref RateLimitTable
+        # YENİ (SORUN 2754 #8): webhook kaçtığında başarısız üretimin
+        # jetonunu burada iade edebilmek için (refundCredits transaction'ı).
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+              Resource: !GetAtt UsersTable.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt UsersTable.Arn
+                - !GetAtt GenerationJobsTable.Arn
       Events:
         Api:
           Type: Api
@@ -860,11 +873,17 @@ Resources:
       Environment:
         Variables:
           RATE_LIMIT_TABLE_NAME: !Ref RateLimitTable
+          # YENİ (SORUN 2754): şarkı sahipliği kontrolü için.
+          JOBS_TABLE_NAME: !Ref GenerationJobsTable
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
         - DynamoDBCrudPolicy:
             TableName: !Ref RateLimitTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref SongsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref GenerationJobsTable
       Events:
         Api:
           Type: Api
@@ -881,11 +900,19 @@ Resources:
       CodeUri: src/
       Handler: saveSong.handler
       Timeout: 60
+      # YENİ (SORUN 2754 #13): ses kaynağı artık kullanıcının kendi üretim
+      # işinden (job) doğrulanıyor -- istemcinin URL'sine güvenilmiyor.
+      Environment:
+        Variables:
+          JOBS_TABLE_NAME: !Ref GenerationJobsTable
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SongsTable
         - S3CrudPolicy:
             BucketName: !Ref AudioBucket
+        # GetItem + TaskIdIndex sorgusu (DynamoDBReadPolicy index'leri kapsar).
+        - DynamoDBReadPolicy:
+            TableName: !Ref GenerationJobsTable
       Events:
         Api:
           Type: Api
@@ -1069,6 +1096,14 @@ Resources:
             TableName: !Ref UsersTable
         - DynamoDBCrudPolicy:
             TableName: !Ref IdempotencyTable
+        # YENİ (SORUN 2754 #3): kilit + jeton ekleme tek transaction.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt UsersTable.Arn
+                - !GetAtt IdempotencyTable.Arn
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/apple-iap-private-key-*'
       Events:
@@ -1096,9 +1131,20 @@ Resources:
           APPLE_IAP_KEY_SECRET_ARN: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/apple-iap-private-key'
           APPLE_IAP_ENVIRONMENT: !Ref AppleIapEnvironment
           APPLE_APP_APPLE_ID: !Ref AppleAppAppleId
+          # YENİ (SORUN 2754 #12): jeton paketi iadesinin tek sefer düşülmesi için.
+          IDEMPOTENCY_TABLE_NAME: !Ref IdempotencyTable
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IdempotencyTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt UsersTable.Arn
+                - !GetAtt IdempotencyTable.Arn
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/apple-iap-private-key-*'
       Events:
@@ -1108,35 +1154,6 @@ Resources:
             RestApiId: !Ref MelodiaApi
             Path: /apple-notifications
             Method: post
-            Auth:
-              Authorizer: NONE
-
-  # GEÇİCİ — SADECE TEST: webhook kurulumunu doğruladıktan sonra bu
-  # fonksiyonu ve requestTestNotification.js dosyasını silebilirsin.
-  RequestTestNotificationFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: src/
-      Handler: requestTestNotification.handler
-      Timeout: 20
-      Environment:
-        Variables:
-          APPLE_BUNDLE_ID: !Ref AppleBundleId
-          APPLE_IAP_ISSUER_ID: !Ref AppleIapIssuerId
-          APPLE_IAP_KEY_ID: !Ref AppleIapKeyId
-          APPLE_IAP_KEY_SECRET_ARN: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/apple-iap-private-key'
-          APPLE_IAP_ENVIRONMENT: !Ref AppleIapEnvironment
-          APPLE_APP_APPLE_ID: !Ref AppleAppAppleId
-      Policies:
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/apple-iap-private-key-*'
-      Events:
-        Api:
-          Type: Api
-          Properties:
-            RestApiId: !Ref MelodiaApi
-            Path: /test-apple-notification
-            Method: get
             Auth:
               Authorizer: NONE
 
