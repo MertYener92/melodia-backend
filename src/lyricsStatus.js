@@ -1,6 +1,6 @@
 const { sunoFetch } = require("./sunoProxy");
 const { checkRateLimit, rateLimitResponse } = require("./rateLimit");
-const { isLyricsTaskOwner } = require("./lyricsTaskOwnership");
+const { getLyricsTask, CLAUDE_TASK_PREFIX } = require("./lyricsTaskOwnership");
 
 exports.handler = async (event) => {
   try {
@@ -18,8 +18,20 @@ exports.handler = async (event) => {
     }
 
     // GÜVENLİK (SORUN 2754): sadece görevi başlatan kullanıcı sorgulayabilir.
-    if (!(await isLyricsTaskOwner(taskId, userId))) {
+    const task = await getLyricsTask(taskId);
+    if (task?.userId !== userId) {
       return { statusCode: 404, body: JSON.stringify({ error: "task_not_found" }) };
+    }
+
+    // YENİ (uzun açıklamalar): Claude ile yazılan sözler -- Suno'nun
+    // /lyrics/record-info cevabıyla AYNI biçimde döndürülür ki uygulamanın
+    // söz bekleme kodu değişmesin.
+    if (taskId.startsWith(CLAUDE_TASK_PREFIX)) {
+      const body =
+        task.status === "SUCCESS"
+          ? { status: "SUCCESS", response: { data: [{ title: task.title || "", text: task.text || "" }] } }
+          : { status: task.status || "PENDING", errorMessage: task.errorMessage };
+      return { statusCode: 200, body: JSON.stringify(body) };
     }
 
     const { ok, status, data } = await sunoFetch(

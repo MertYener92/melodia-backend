@@ -81,6 +81,13 @@ Parameters:
     Description: >
       pro_yearly plani -- pro_monthly ile AYNI aylik jeton hakki (yillik
       odeme sadece faturalama sikligini degistiriyor).
+  LyricsModelId:
+    Type: String
+    Default: "claude-opus-5"
+    Description: >
+      200 karakteri asan sarki aciklamalarinda sozleri yazan Claude modeli
+      (bkz. src/lyricsWriter.js). Maliyeti dusurmek icin ornegin
+      "claude-haiku-4-5" yapilabilir -- sadece "sam deploy" yeter.
 
 Globals:
   Function:
@@ -629,11 +636,15 @@ Resources:
       Environment:
         Variables:
           RATE_LIMIT_TABLE_NAME: !Ref RateLimitTable
+          # YENİ: 200 karakteri aşan açıklamalarda sözleri arka planda yazan fonksiyon.
+          LYRICS_WRITER_FUNCTION_NAME: !Ref LyricsWriterFunction
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/suno-api-key-*'
         - DynamoDBCrudPolicy:
             TableName: !Ref RateLimitTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref LyricsWriterFunction
       Events:
         Api:
           Type: Api
@@ -641,6 +652,28 @@ Resources:
             RestApiId: !Ref MelodiaApi
             Path: /lyrics
             Method: post
+
+  # YENİ (uzun şarkı açıklamaları, 3000 karaktere kadar): Suno'nun söz ucu
+  # en fazla 200 karakter kabul ediyor; daha uzun açıklamalarda sözler bu
+  # fonksiyonda Claude ile yazılır. LyricsFunction tarafından ASENKRON
+  # tetiklenir (API Gateway'in 29 sn sınırı dışında), sonucu söz görev
+  # kaydına yazar, LyricsStatusFunction onu Suno formatında döndürür.
+  LyricsWriterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: lyricsWriter.handler
+      Timeout: 120
+      Environment:
+        Variables:
+          RATE_LIMIT_TABLE_NAME: !Ref RateLimitTable
+          LYRICS_MODEL_ID: !Ref LyricsModelId
+          ANTHROPIC_SECRET_ARN: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/anthropic-api-key'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RateLimitTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:melodia/anthropic-api-key-*'
 
   LyricsStatusFunction:
     Type: AWS::Serverless::Function
