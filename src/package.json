@@ -12,6 +12,8 @@
     "@aws-sdk/client-secrets-manager": "^3.600.0",
     "@apple/app-store-server-library": "^1.5.0",
     "jsonwebtoken": "^9.0.2",
-    "jwks-rsa": "^3.1.0"
+    "jwks-rsa": "^3.1.0",
+    "@anthropic-ai/sdk": "^0.127.0",
+    "@aws-sdk/client-lambda": "^3.600.0"
   }
 }
