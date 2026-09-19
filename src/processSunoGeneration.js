@@ -26,6 +26,16 @@ const {
   markFailed,
   markReady,
 } = require("./jobLifecycle");
+const { signMediaUrl } = require("./cloudfrontSigner");
+
+// Normal üretim ve remix AYNI modeli kullanır -- maliyet ölçümü (üretim
+// başına ~0,07$) bu modele göre yapıldı. NOT: Suno dokümanı V5_5'i
+// "deprecated" olarak işaretliyor; model değişirse maliyet yeniden ölçülmeli.
+const SUNO_MODEL = "V5_5";
+
+// YENİ (Remix): Suno kaynak sesi bu linkten indiriyor. Kuyruk/rate limit
+// gecikmeleri ve Suno'nun kendi kuyruğu için bol pay bırakıyoruz.
+const REMIX_SOURCE_URL_TTL_SECONDS = 2 * 60 * 60;
 
 // HTTP 5xx ve 429 (rate limit) = geçici, yeniden denemeye değer.
 // Diğer her şey (400 gibi parametre/içerik reddi) = kalıcı, tekrar
@@ -33,6 +43,28 @@ const {
 // iadesi, bkz. jobLifecycle.markFailed).
 function isTransientSunoError(status) {
   return status >= 500 || status === 429;
+}
+
+// Job'a göre Suno isteğini hazırlar: normal üretim -> /generate,
+// remix -> /generate/upload-cover (aynı callback/status akışı).
+async function buildSunoRequest(job) {
+  const { payload } = job;
+  const common = {
+    customMode: true,
+    instrumental: payload.instrumental,
+    style: payload.style,
+    title: payload.title,
+    model: SUNO_MODEL,
+    callBackUrl: job.callBackUrl,
+  };
+  // Custom mode'da prompt = şarkı sözü; enstrümantalde gönderilmez.
+  if (!payload.instrumental) common.prompt = payload.lyrics;
+
+  if (payload.operation === "cover") {
+    const uploadUrl = await signMediaUrl(payload.sourceAudioKey, REMIX_SOURCE_URL_TTL_SECONDS);
+    return { path: "/api/v1/generate/upload-cover", body: { ...common, uploadUrl } };
+  }
+  return { path: "/api/v1/generate", body: { ...common, prompt: payload.lyrics } };
 }
 
 exports.handler = async (event) => {
@@ -47,17 +79,10 @@ exports.handler = async (event) => {
     }
 
     try {
-      const { ok, status, data } = await sunoFetch("/api/v1/generate", {
+      const request = await buildSunoRequest(job);
+      const { ok, status, data } = await sunoFetch(request.path, {
         method: "POST",
-        body: JSON.stringify({
-          customMode: true,
-          instrumental: job.payload.instrumental,
-          prompt: job.payload.lyrics,
-          style: job.payload.style,
-          title: job.payload.title,
-          model: "V5_5",
-          callBackUrl: job.callBackUrl,
-        }),
+        body: JSON.stringify(request.body),
       });
 
       if (!ok) {
